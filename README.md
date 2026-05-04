@@ -73,7 +73,8 @@ Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
 - Detects fonts used in the uploaded PDF and records whether they appear embedded
 - Chooses the best PDF page rotation for each slide from `0`, `90`, and `270`
 - Creates a new PPTX with the original slide content intact
-- Parks each matching PDF page as an opaque movable picture just off the top-right of the slide so reviewers can drag it in when needed
+- Parks each matching PDF page as an opaque movable picture named `PDF_ORIGINAL` just off the top-right of the slide so reviewers can drag it in when needed
+- Inserts a full-slide PDF screenshot immediately after each matched PPTX slide for slide-by-slide review, with the slide name set to `PDF_ORIGINAL`
 - Bakes a red border into each parked reference image so the screenshot and its outline move as one piece
 - Appends unmatched PDF pages as full-slide reference slides at the end of the deck
 - Returns `<original-name>_with_pdf_pages.pptx`

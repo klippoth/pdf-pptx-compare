@@ -18,12 +18,15 @@ class DeckWriter:
         self.parked_width_ratio = parked_width_ratio
         self.visible_peek_ratio = visible_peek_ratio
         self.top_margin_ratio = top_margin_ratio
-        self.sticky_shape_name = "Sticky"
+        self.pdf_reference_shape_name = "PDF_ORIGINAL"
+        self.pdf_reference_slide_name = "PDF_ORIGINAL"
 
     def build_output(self, source_pptx: Path, placement_bundle: PlacementBundle, output_path: Path) -> Path:
         presentation = Presentation(str(source_pptx))
+        original_slides = list(presentation.slides)
+        reference_insertions: list[tuple[int, PagePlacementResult]] = []
 
-        for slide_index, slide in enumerate(presentation.slides):
+        for slide_index, slide in enumerate(original_slides):
             if slide_index >= len(placement_bundle.slide_results):
                 break
             result = placement_bundle.slide_results[slide_index]
@@ -34,6 +37,14 @@ class DeckWriter:
                     slide_width=presentation.slide_width,
                     slide_height=presentation.slide_height,
                 )
+                reference_insertions.append((slide_index, result))
+
+        for slide_index, result in reversed(reference_insertions):
+            self._insert_pdf_reference_slide_after(
+                presentation=presentation,
+                insert_after_index=slide_index,
+                result=result,
+            )
 
         for result in placement_bundle.extra_reference_results:
             self._append_pdf_only_slide(
@@ -50,8 +61,8 @@ class DeckWriter:
         presentation: Presentation,
         result: PagePlacementResult,
     ) -> None:
-        layout = presentation.slide_layouts[6] if len(presentation.slide_layouts) > 6 else presentation.slide_layouts[-1]
-        slide = presentation.slides.add_slide(layout)
+        slide = self._append_blank_slide(presentation)
+        self._set_slide_name(slide, self.pdf_reference_slide_name)
         if result.background_image_path:
             self._add_full_slide_picture(
                 slide=slide,
@@ -60,6 +71,33 @@ class DeckWriter:
                 slide_height=presentation.slide_height,
             )
 
+    def _insert_pdf_reference_slide_after(
+        self,
+        presentation: Presentation,
+        insert_after_index: int,
+        result: PagePlacementResult,
+    ) -> None:
+        slide = self._append_blank_slide(presentation)
+        self._set_slide_name(slide, self.pdf_reference_slide_name)
+        if result.background_image_path:
+            self._add_full_slide_picture(
+                slide=slide,
+                image_path=result.background_image_path,
+                slide_width=presentation.slide_width,
+                slide_height=presentation.slide_height,
+            )
+        self._move_last_slide_to_index(presentation, insert_after_index + 1)
+
+    def _append_blank_slide(self, presentation: Presentation):
+        layout = presentation.slide_layouts[6] if len(presentation.slide_layouts) > 6 else presentation.slide_layouts[-1]
+        return presentation.slides.add_slide(layout)
+
+    def _move_last_slide_to_index(self, presentation: Presentation, insert_index: int) -> None:
+        slide_id_list = presentation.slides._sldIdLst
+        slide_id = slide_id_list[-1]
+        slide_id_list.remove(slide_id)
+        slide_id_list.insert(insert_index, slide_id)
+
     def _add_parked_reference_picture(self, slide, image_path: Path, slide_width: Emu, slide_height: Emu) -> None:
         parked_width = max(1, int(round(slide_width * self.parked_width_ratio)))
         parked_height = max(1, int(round(slide_height * self.parked_width_ratio)))
@@ -67,8 +105,11 @@ class DeckWriter:
         left = int(slide_width - visible_peek)
         top = int(round(slide_height * self.top_margin_ratio))
         picture = slide.shapes.add_picture(str(image_path), left, top, width=parked_width, height=parked_height)
-        picture.name = self.sticky_shape_name
+        picture.name = self.pdf_reference_shape_name
 
     def _add_full_slide_picture(self, slide, image_path: Path, slide_width: Emu, slide_height: Emu) -> None:
         picture = slide.shapes.add_picture(str(image_path), 0, 0, width=slide_width, height=slide_height)
-        picture.name = self.sticky_shape_name
+        picture.name = self.pdf_reference_shape_name
+
+    def _set_slide_name(self, slide, name: str) -> None:
+        slide._element.cSld.set("name", name)
