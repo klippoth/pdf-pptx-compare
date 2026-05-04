@@ -1,0 +1,14 @@
+.venv/
+.venv-windows/
+__pycache__/
+.pytest_cache/
+runs/
+*.pyc
+.DS_Store
+build/
+build-windows/
+dist/
+dist-windows/
+deliverables/
+PDFtoPPTXReference.spec
+pdf-font-inspector/

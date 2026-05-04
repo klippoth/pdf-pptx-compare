@@ -1,0 +1,100 @@
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+from app.config import get_settings
+from app.schemas import CompareResponse, JobStatusResponse, PDFFontInfoResponse
+from app.services.jobs import JobManager
+
+
+settings = get_settings()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    job_manager = JobManager(settings=settings)
+    job_manager.start()
+    app.state.job_manager = job_manager
+    try:
+        yield
+    finally:
+        job_manager.stop()
+
+
+app = FastAPI(title="PDF-to-PPTX Redline", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=settings.static_dir), name="static")
+
+
+@app.get("/", include_in_schema=False)
+async def index() -> FileResponse:
+    return FileResponse(settings.static_dir / "index.html")
+
+
+@app.get("/api/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post("/api/compare", response_model=CompareResponse, status_code=202)
+async def compare(
+    request: Request,
+    pdf: UploadFile = File(...),
+    pptx: UploadFile = File(...),
+) -> CompareResponse:
+    if Path(pdf.filename or "").suffix.lower() != ".pdf":
+        raise HTTPException(status_code=400, detail="The `pdf` upload must be a .pdf file.")
+    if Path(pptx.filename or "").suffix.lower() != ".pptx":
+        raise HTTPException(status_code=400, detail="The `pptx` upload must be a .pptx file.")
+
+    job = request.app.state.job_manager.create_job(pdf_upload=pdf, pptx_upload=pptx)
+    return CompareResponse(jobId=job.job_id, status=job.status)
+
+
+@app.get("/api/jobs/{job_id}", response_model=JobStatusResponse)
+async def get_job(job_id: str, request: Request) -> JobStatusResponse:
+    job = request.app.state.job_manager.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    return JobStatusResponse(
+        jobId=job.job_id,
+        status=job.status,
+        step=job.step,
+        slideProgress=job.slide_progress,
+        slideCount=job.slide_count,
+        outputReady=bool(job.output_pptx_path and job.output_pptx_path.exists()),
+        pdfPageCount=job.pdf_page_count,
+        pdfPageCharacterTotals=job.pdf_page_character_totals,
+        pdfFonts=[
+            PDFFontInfoResponse(
+                name=font.name,
+                fontType=font.font_type,
+                embedded=font.embedded,
+                subset=font.subset,
+                pageNumbers=font.page_numbers,
+                pageCharacterCounts=font.page_character_counts,
+            )
+            for font in job.pdf_fonts
+        ],
+        error=job.error,
+    )
+
+
+@app.get("/api/jobs/{job_id}/download")
+async def download(job_id: str, request: Request) -> FileResponse:
+    job = request.app.state.job_manager.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if not job.output_pptx_path or not job.output_pptx_path.exists():
+        raise HTTPException(status_code=409, detail="Job output is not ready yet.")
+
+    return FileResponse(
+        path=job.output_pptx_path,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        filename=job.output_pptx_path.name,
+    )

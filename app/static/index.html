@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PDF to PPTX Reference Placement</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">Review Tool</p>
+        <h1>Compare a PDF with a PowerPoint deck</h1>
+        <p class="lede">
+          Drop one PDF and one PPTX to generate a review copy of the deck with the PDF pages parked
+          beside the slides for reference.
+        </p>
+      </section>
+
+      <section class="panel">
+        <form id="compare-form" class="upload-grid">
+          <label class="dropzone" for="upload-input">
+            <span class="dropzone-kicker">Reference Files</span>
+            <strong>Drop the PDF and PowerPoint here</strong>
+            <span class="dropzone-note">or click to browse for both in any order</span>
+            <input
+              id="upload-input"
+              type="file"
+              accept=".pdf,.pptx,application/pdf,application/vnd.openxmlformats-officedocument.presentationml.presentation"
+              multiple
+              hidden
+            />
+            <div class="selection-pills">
+              <span id="pdf-name" class="file-pill">PDF: none selected</span>
+              <span id="pptx-name" class="file-pill">PPTX: none selected</span>
+            </div>
+          </label>
+          <input id="pdf-input" name="pdf" type="file" accept=".pdf,application/pdf" hidden />
+          <input
+            id="pptx-input"
+            name="pptx"
+            type="file"
+            accept=".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            hidden
+          />
+
+          <div class="actions">
+            <button id="submit-button" type="submit">Create Updated Deck</button>
+            <div class="helper-stack">
+              <p class="helper">
+                Works on macOS and Windows. LibreOffice export is used by default so PowerPoint does not
+                keep opening during conversion.
+              </p>
+              <p id="submit-state-note" class="submit-state-note hidden"></p>
+            </div>
+          </div>
+        </form>
+      </section>
+
+      <section id="status-panel" class="status-panel hidden" aria-live="polite">
+        <div class="status-header">
+          <div>
+            <p class="eyebrow">Job Status</p>
+            <h2 id="status-title">Preparing job</h2>
+          </div>
+          <span id="status-badge" class="status-badge">Queued</span>
+        </div>
+
+        <div class="meter">
+          <div id="meter-bar" class="meter-bar"></div>
+        </div>
+
+        <div class="status-copy">
+          <p id="status-step">Waiting to start…</p>
+          <p id="status-meta">0 / 0 slides processed</p>
+        </div>
+
+        <a id="download-link" class="download-link hidden" href="#">Download updated PPTX</a>
+
+        <div id="font-panel" class="font-panel hidden">
+          <h3>PDF Fonts</h3>
+          <p id="font-summary" class="font-summary"></p>
+          <details id="font-unique-details" class="font-unique-details">
+            <summary id="font-unique-summary">Unique fonts</summary>
+            <div id="font-unique-list" class="font-unique-list"></div>
+          </details>
+          <div class="font-page-wrap">
+            <table id="font-grid" class="font-grid"></table>
+          </div>
+        </div>
+
+        <p id="error-copy" class="error-copy hidden"></p>
+      </section>
+    </main>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
