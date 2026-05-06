@@ -19,7 +19,7 @@ class _PlacementCandidate:
 
 
 class BackgroundComposer:
-    def __init__(self, rotations: tuple[int, ...] = (0, 90, 270)):
+    def __init__(self, rotations: tuple[int, ...] = (0,)):
         self.rotations = rotations
 
     def prepare_background(
@@ -37,7 +37,7 @@ class BackgroundComposer:
             reference_page_index=reference_page.page_index,
             status=PlacementStatus.PLACED,
             background_image_path=output_path,
-            message="Parked PDF page off the top-right of the slide as a movable reference image",
+            message="Prepared the PDF page as a full-slide reference image",
             rotation_degrees=best.angle,
             similarity_score=best.similarity_score,
         )

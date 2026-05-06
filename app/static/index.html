@@ -12,8 +12,8 @@
         <p class="eyebrow">Review Tool</p>
         <h1>Compare a PDF with a PowerPoint deck</h1>
         <p class="lede">
-          Drop one PDF and one PPTX to generate a review copy of the deck with the PDF pages parked
-          beside the slides for reference.
+          Drop one PDF and one PPTX to generate a review copy of the deck with a full-slide PDF
+          reference page inserted after each original slide.
         </p>
       </section>
 
@@ -47,10 +47,18 @@
           <div class="actions">
             <button id="submit-button" type="submit">Create Updated Deck</button>
             <div class="helper-stack">
-              <p class="helper">
-                Works on macOS and Windows. LibreOffice export is used by default so PowerPoint does not
-                keep opening during conversion.
+              <label class="toggle-row" for="ai-qc-toggle">
+                <input id="ai-qc-toggle" type="checkbox" checked />
+                <span>Enable AI QC annotations</span>
+              </label>
+              <p class="toggle-note">
+                Uncheck this to only insert the PDF reference slides, without AI comments or rectangles.
               </p>
+              <p id="runtime-helper" class="helper">
+                Works on macOS and Windows. AI comparison prefers PowerPoint-rendered PDF pages when
+                PowerPoint is available.
+              </p>
+              <p id="runtime-note" class="helper hidden"></p>
               <p id="submit-state-note" class="submit-state-note hidden"></p>
             </div>
           </div>

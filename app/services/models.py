@@ -22,6 +22,37 @@ class PlacementStatus(str, Enum):
     EXTRA_PDF_PAGE = "extra_pdf_page"
 
 
+class TextSource(str, Enum):
+    NATIVE = "native"
+    OCR = "ocr"
+    MODEL = "model"
+
+
+class SlideQcStatus(str, Enum):
+    OK = "ok"
+    FINDINGS = "findings"
+    MANUAL_REVIEW = "manual_review"
+
+
+class QcFindingType(str, Enum):
+    MISSING_CONTENT = "missing_content"
+    EXTRA_CONTENT = "extra_content"
+    WRONG_TEXT = "wrong_text"
+    LINE_BREAK_ISSUE = "line_break_issue"
+    ALIGNMENT_DRIFT = "alignment_drift"
+    SIZE_POSITION_ISSUE = "size_position_issue"
+    WRONG_COLOR = "wrong_color"
+
+
+class QcFindingSeverity(str, Enum):
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+NormalizedBBox = tuple[float, float, float, float]
+
+
 @dataclass
 class PageImage:
     page_index: int
@@ -55,6 +86,97 @@ class PlacementBundle:
 
 
 @dataclass
+class TextBox:
+    text: str
+    bbox: NormalizedBBox
+    page_number: int
+    confidence: float
+    source: TextSource
+
+
+@dataclass
+class ParagraphLayout:
+    text: str
+    lines: list[TextBox]
+    bbox: NormalizedBBox
+    page_number: int
+    confidence: float
+    source: TextSource
+
+
+@dataclass
+class TextLayout:
+    page_number: int
+    page_size: tuple[float, float]
+    paragraphs: list[ParagraphLayout] = field(default_factory=list)
+    lines: list[TextBox] = field(default_factory=list)
+    source: TextSource = TextSource.NATIVE
+    total_characters: int = 0
+    average_confidence: float = 0.0
+    extracted_with_ocr: bool = False
+
+
+@dataclass
+class PageAlignment:
+    page_index: int
+    angle: int
+    aligned_reference_image: np.ndarray
+    similarity_score: float
+    target_size: tuple[int, int]
+    offset: tuple[int, int]
+    scaled_size: tuple[int, int]
+
+
+@dataclass
+class VisualDiffRegion:
+    bbox: NormalizedBBox
+    area_ratio: float
+
+
+@dataclass
+class VisualDiff:
+    page_index: int
+    alignment: PageAlignment
+    missing_regions: list[VisualDiffRegion] = field(default_factory=list)
+    geometry_regions: list[VisualDiffRegion] = field(default_factory=list)
+    color_regions: list[VisualDiffRegion] = field(default_factory=list)
+    missing_mask_path: Optional[Path] = None
+    geometry_mask_path: Optional[Path] = None
+    color_mask_path: Optional[Path] = None
+
+
+@dataclass
+class SlideQcFinding:
+    finding_id: int
+    finding_type: QcFindingType
+    severity: QcFindingSeverity
+    bbox: NormalizedBBox
+    message: str
+    confidence: float
+
+
+@dataclass
+class SlideQcResult:
+    slide_index: int
+    page_index: int
+    status: SlideQcStatus
+    findings: list[SlideQcFinding] = field(default_factory=list)
+    alignment_confidence: float = 0.0
+    reference_source: TextSource = TextSource.NATIVE
+    candidate_source: TextSource = TextSource.NATIVE
+    summary: Optional[str] = None
+    comment_bullets: list[str] = field(default_factory=list)
+    note: Optional[str] = None
+
+
+@dataclass
+class QcReport:
+    slide_results: list[SlideQcResult] = field(default_factory=list)
+    counts_by_type: dict[str, int] = field(default_factory=dict)
+    manual_review_count: int = 0
+
+
+@dataclass
 class PDFFontInfo:
     name: str
     font_type: str
@@ -78,6 +200,7 @@ class JobRecord:
     input_pdf_path: Path
     input_pptx_path: Path
     original_pptx_name: str
+    enable_ai_qc: bool = True
     status: str = JobState.QUEUED.value
     step: str = "Queued for processing"
     slide_progress: int = 0
@@ -87,5 +210,8 @@ class JobRecord:
     pdf_fonts: list[PDFFontInfo] = field(default_factory=list)
     pdf_page_character_totals: dict[int, int] = field(default_factory=dict)
     pdf_page_count: int = 0
+    qc_report_path: Optional[Path] = None
+    qc_counts_by_type: dict[str, int] = field(default_factory=dict)
+    qc_manual_review_count: int = 0
     error: Optional[str] = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))

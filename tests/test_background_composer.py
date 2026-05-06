@@ -26,7 +26,7 @@ def _page(path: Path, image: np.ndarray, index: int) -> PageImage:
     return PageImage(page_index=index, image=image, image_path=path)
 
 
-def test_background_composer_rotates_reference_to_match_slide(tmp_path: Path) -> None:
+def test_background_composer_preserves_reference_rotation(tmp_path: Path) -> None:
     composer = BackgroundComposer()
     candidate = _make_slide_art()
     reference = np.rot90(candidate, 1).copy()
@@ -38,7 +38,7 @@ def test_background_composer_rotates_reference_to_match_slide(tmp_path: Path) ->
     )
 
     assert result.status == PlacementStatus.PLACED
-    assert result.rotation_degrees == 270
+    assert result.rotation_degrees == 0
     assert result.background_image_path.exists()
     with Image.open(result.background_image_path) as image:
         assert image.size == (candidate.shape[1], candidate.shape[0])
@@ -55,7 +55,7 @@ def test_background_composer_excludes_upside_down_rotation_and_keeps_reference_i
         output_path=tmp_path / "background.png",
     )
 
-    assert 180 not in composer.rotations
+    assert composer.rotations == (0,)
     with Image.open(result.background_image_path) as image:
         assert image.mode == "RGB"
         output = np.array(image)

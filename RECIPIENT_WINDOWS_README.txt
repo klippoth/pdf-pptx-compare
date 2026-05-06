@@ -15,4 +15,6 @@ What you need installed:
 Notes:
 - LibreOffice is used first when available
 - On Windows, PowerPoint fallback is enabled by default
+- If Microsoft PowerPoint is installed, the app can also export slide PNGs directly through native PowerPoint automation for AI comparison
+- No AppleScript or macOS VBA add-in setup is required on Windows
 - The app runs locally on your machine and opens in your browser

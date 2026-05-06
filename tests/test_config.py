@@ -57,3 +57,23 @@ def test_runs_dir_can_be_overridden(monkeypatch, tmp_path: Path) -> None:
         assert settings.runs_dir == tmp_path / "custom-runs"
     finally:
         config.get_settings.cache_clear()
+
+
+def test_ai_qc_renderer_preferences_can_be_overridden(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("PDF_PPTX_PREFER_POWERPOINT_FOR_AI_QC", "false")
+    monkeypatch.setenv("PDF_PPTX_PREFER_POPPLER_FOR_AI_QC", "false")
+    monkeypatch.setenv("PDF_PPTX_POPPLER_BIN_DIR", str(tmp_path / "poppler-bin"))
+    monkeypatch.setenv("PDF_PPTX_POWERPOINT_SLIDE_EXPORT_MACRO_NAME", "ExportSlidesToFolder")
+    monkeypatch.setenv("PDF_PPTX_POWERPOINT_SLIDE_EXPORT_STAGING_DIR", str(tmp_path / "ppt-stage"))
+    config.get_settings.cache_clear()
+
+    try:
+        settings = config.get_settings()
+
+        assert settings.prefer_powerpoint_for_ai_qc is False
+        assert settings.prefer_poppler_for_ai_qc is False
+        assert settings.poppler_bin_dir == tmp_path / "poppler-bin"
+        assert settings.powerpoint_slide_export_macro_name == "ExportSlidesToFolder"
+        assert settings.powerpoint_slide_export_staging_dir == tmp_path / "ppt-stage"
+    finally:
+        config.get_settings.cache_clear()

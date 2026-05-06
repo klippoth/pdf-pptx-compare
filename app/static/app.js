@@ -20,13 +20,18 @@ const pdfInput = document.getElementById("pdf-input");
 const pptxInput = document.getElementById("pptx-input");
 const pdfName = document.getElementById("pdf-name");
 const pptxName = document.getElementById("pptx-name");
+const runtimeHelper = document.getElementById("runtime-helper");
+const runtimeNote = document.getElementById("runtime-note");
 const submitStateNote = document.getElementById("submit-state-note");
 const dropzone = document.querySelector(".dropzone");
+const aiQcToggle = document.getElementById("ai-qc-toggle");
 
 let pollTimer = null;
 let isJobActive = false;
 let activeSubmissionFingerprint = null;
 let lastCompletedSubmission = null;
+let rendererCanConvert = true;
+let rendererMessage = "";
 const lastCompletedStorageKey = "pdf-to-pptx-last-completed-pair";
 const apiOrigin =
   window.location.protocol === "http:" || window.location.protocol === "https:"
@@ -36,6 +41,7 @@ const apiOrigin =
 const isPdfFile = (file) => file.name?.toLowerCase().endsWith(".pdf");
 const isPptxFile = (file) => file.name?.toLowerCase().endsWith(".pptx");
 const buildApiUrl = (path) => (apiOrigin ? `${apiOrigin}${path}` : path);
+const hasFilePayload = (event) => Array.from(event.dataTransfer?.types || []).includes("Files");
 
 const backendUnavailableMessage = () => {
   if (!apiOrigin) {
@@ -73,14 +79,15 @@ const buildFileFingerprint = (file) => {
   return [file.name || "", file.size || 0, file.lastModified || 0].join("::");
 };
 
-const buildSelectedPairFingerprint = (pdfFile, pptxFile) => {
+const buildSelectedPairFingerprint = (pdfFile, pptxFile, aiQcEnabled = aiQcToggle?.checked ?? true) => {
   if (!pdfFile || !pptxFile) {
     return null;
   }
   return {
-    fingerprint: `${buildFileFingerprint(pdfFile)}__${buildFileFingerprint(pptxFile)}`,
+    fingerprint: `${buildFileFingerprint(pdfFile)}__${buildFileFingerprint(pptxFile)}__ai:${aiQcEnabled ? "on" : "off"}`,
     pdfName: pdfFile.name || "reference.pdf",
     pptxName: pptxFile.name || "candidate.pptx",
+    aiQcEnabled,
     completedAt: new Date().toISOString(),
   };
 };
@@ -100,7 +107,28 @@ const formatCompletedAt = (isoValue) => {
 };
 
 const getCurrentSelectionFingerprint = () => {
-  return buildSelectedPairFingerprint(pdfInput.files?.[0], pptxInput.files?.[0]);
+  return buildSelectedPairFingerprint(pdfInput.files?.[0], pptxInput.files?.[0], aiQcToggle?.checked ?? true);
+};
+
+const applyRendererStatus = (renderer) => {
+  rendererCanConvert = Boolean(renderer?.canConvert);
+  rendererMessage = renderer?.message || "";
+
+  if (runtimeHelper && rendererMessage) {
+    runtimeHelper.textContent = rendererMessage;
+  }
+
+  if (!runtimeNote) {
+    return;
+  }
+
+  if (rendererCanConvert) {
+    runtimeNote.textContent = "";
+    runtimeNote.classList.add("hidden");
+  } else {
+    runtimeNote.textContent = rendererMessage || "No supported converter is available on this machine.";
+    runtimeNote.classList.remove("hidden");
+  }
 };
 
 const updateSubmitAvailability = () => {
@@ -111,15 +139,30 @@ const updateSubmitAvailability = () => {
       currentSelection.fingerprint === lastCompletedSubmission.fingerprint,
   );
 
-  submitButton.disabled = isJobActive || isDuplicateSelection;
-  submitButton.dataset.state = isJobActive ? "processing" : isDuplicateSelection ? "duplicate" : "ready";
+  submitButton.disabled = isJobActive || isDuplicateSelection || !rendererCanConvert;
+  submitButton.dataset.state = isJobActive
+    ? "processing"
+    : !rendererCanConvert
+      ? "unavailable"
+      : isDuplicateSelection
+        ? "duplicate"
+        : "ready";
   submitButton.textContent = isJobActive
     ? "Creating Updated Deck..."
+    : !rendererCanConvert
+      ? "Install LibreOffice or PowerPoint"
     : isDuplicateSelection
       ? "Already Converted"
       : "Create Updated Deck";
 
-  if (isDuplicateSelection && lastCompletedSubmission) {
+  if (!submitStateNote) {
+    return;
+  }
+
+  if (!rendererCanConvert) {
+    submitStateNote.textContent = rendererMessage || "A supported converter is not available on this machine.";
+    submitStateNote.classList.remove("hidden");
+  } else if (isDuplicateSelection && lastCompletedSubmission) {
     submitStateNote.textContent = `This exact PDF/PPTX pair was already converted on ${formatCompletedAt(lastCompletedSubmission.completedAt)}. Change one of the files to create a new deck.`;
     submitStateNote.classList.remove("hidden");
   } else {
@@ -144,6 +187,9 @@ const refreshSelectedFiles = () => {
 };
 
 const setDragState = (element, active) => {
+  if (!element) {
+    return;
+  }
   element.classList.toggle("drag-active", active);
 };
 
@@ -330,6 +376,12 @@ const ensureBackendAvailable = async () => {
     if (!response.ok) {
       throw new Error(backendUnavailableMessage());
     }
+    const payload = await response.json();
+    applyRendererStatus(payload.renderer);
+    updateSubmitAvailability();
+    if (!payload.renderer?.canConvert) {
+      throw new Error(payload.renderer?.message || "No supported converter is available on this machine.");
+    }
   } catch (error) {
     if (error instanceof Error && error.message) {
       throw error;
@@ -338,20 +390,58 @@ const ensureBackendAvailable = async () => {
   }
 };
 
-dropzone.addEventListener("dragenter", () => setDragState(dropzone, true));
-dropzone.addEventListener("dragover", (event) => {
-  event.preventDefault();
-  setDragState(dropzone, true);
-});
-dropzone.addEventListener("dragleave", () => setDragState(dropzone, false));
-dropzone.addEventListener("drop", (event) => {
-  event.preventDefault();
-  setDragState(dropzone, false);
+const handleDroppedFiles = (files) => {
   try {
-    assignSelectedFiles(event.dataTransfer?.files);
+    assignSelectedFiles(files);
   } catch (error) {
     errorCopy.textContent = error.message;
     errorCopy.classList.remove("hidden");
+  }
+};
+
+if (dropzone) {
+  dropzone.addEventListener("dragenter", (event) => {
+    if (!hasFilePayload(event)) {
+      return;
+    }
+    event.preventDefault();
+    setDragState(dropzone, true);
+  });
+  dropzone.addEventListener("dragover", (event) => {
+    if (!hasFilePayload(event)) {
+      return;
+    }
+    event.preventDefault();
+    setDragState(dropzone, true);
+  });
+  dropzone.addEventListener("dragleave", () => setDragState(dropzone, false));
+  dropzone.addEventListener("drop", (event) => {
+    if (!hasFilePayload(event)) {
+      return;
+    }
+    event.preventDefault();
+    setDragState(dropzone, false);
+    handleDroppedFiles(event.dataTransfer?.files);
+  });
+}
+
+window.addEventListener("dragover", (event) => {
+  if (!hasFilePayload(event)) {
+    return;
+  }
+  event.preventDefault();
+});
+
+window.addEventListener("drop", (event) => {
+  if (!hasFilePayload(event)) {
+    return;
+  }
+  event.preventDefault();
+  setDragState(dropzone, false);
+
+  const droppedInsideZone = dropzone && event.target instanceof Node && dropzone.contains(event.target);
+  if (!droppedInsideZone) {
+    handleDroppedFiles(event.dataTransfer?.files);
   }
 });
 
@@ -363,6 +453,12 @@ uploadInput.addEventListener("change", () => {
     errorCopy.classList.remove("hidden");
   }
 });
+
+if (aiQcToggle) {
+  aiQcToggle.addEventListener("change", () => {
+    updateSubmitAvailability();
+  });
+}
 
 const updateStatus = (job) => {
   statusPanel.classList.remove("hidden");
@@ -377,7 +473,7 @@ const updateStatus = (job) => {
   if (job.status === "queued") {
     statusTitle.textContent = "Waiting in queue";
   } else if (job.status === "processing") {
-    statusTitle.textContent = "Parking PDF references";
+    statusTitle.textContent = job.aiQcEnabled === false ? "Preparing PDF reference deck" : "Parking PDF references";
   } else if (job.status === "completed") {
     statusTitle.textContent = "Updated deck ready";
   } else {
@@ -461,6 +557,7 @@ form.addEventListener("submit", async (event) => {
   const data = new FormData();
   data.append("pdf", pdfInput.files[0]);
   data.append("pptx", pptxInput.files[0]);
+  data.append("enable_ai_qc", aiQcToggle?.checked ? "true" : "false");
 
   try {
     await ensureBackendAvailable();
@@ -482,10 +579,11 @@ form.addEventListener("submit", async (event) => {
     updateStatus({
       jobId: payload.jobId,
       status: payload.status,
-      step: "Queued for processing",
+      step: payload.aiQcEnabled ? "Queued for processing" : "Queued for PDF insertion",
       slideProgress: 0,
       slideCount: 0,
       outputReady: false,
+      aiQcEnabled: payload.aiQcEnabled,
       pdfPageCount: 0,
       pdfPageCharacterTotals: {},
       pdfFonts: [],

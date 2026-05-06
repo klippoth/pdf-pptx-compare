@@ -6,7 +6,17 @@ from PIL import Image
 from pptx import Presentation
 
 from app.services.deck_writer import DeckWriter
-from app.services.models import PagePlacementResult, PlacementBundle, PlacementStatus
+from app.services.models import (
+    PagePlacementResult,
+    PlacementBundle,
+    PlacementStatus,
+    QcFindingSeverity,
+    QcFindingType,
+    QcReport,
+    SlideQcFinding,
+    SlideQcResult,
+    SlideQcStatus,
+)
 
 
 def _make_png(path: Path, size: tuple[int, int] = (1200, 700), color: tuple[int, int, int] = (255, 255, 255)) -> Path:
@@ -35,14 +45,14 @@ def test_build_output_preserves_slides_inserts_pdf_reference_slides_and_appends_
                 reference_page_index=0,
                 status=PlacementStatus.PLACED,
                 background_image_path=background_image,
-                message="Parked PDF page off the top-right of the slide as a movable reference image",
+                message="Inserted PDF page as a full-slide reference slide after the original slide",
             ),
             PagePlacementResult(
                 candidate_slide_index=1,
                 reference_page_index=1,
                 status=PlacementStatus.PLACED,
                 background_image_path=second_background_image,
-                message="Parked PDF page off the top-right of the slide as a movable reference image",
+                message="Inserted PDF page as a full-slide reference slide after the original slide",
             )
         ],
         extra_reference_results=[
@@ -61,11 +71,7 @@ def test_build_output_preserves_slides_inserts_pdf_reference_slides_and_appends_
     updated = Presentation(output_pptx)
     assert updated.slide_width == presentation.slide_width
     assert len(updated.slides) == 5
-    assert len(updated.slides[0].shapes) == 2
-    parked_picture = updated.slides[0].shapes[-1]
-    assert parked_picture.left < updated.slide_width
-    assert parked_picture.left + parked_picture.width > updated.slide_width
-    assert parked_picture.name == "PDF_ORIGINAL"
+    assert len(updated.slides[0].shapes) == 1
     assert len(updated.slides[1].shapes) == 1
     first_reference_slide = updated.slides[1].shapes[0]
     assert first_reference_slide.left == 0
@@ -75,11 +81,7 @@ def test_build_output_preserves_slides_inserts_pdf_reference_slides_and_appends_
     assert first_reference_slide.name == "PDF_ORIGINAL"
     assert updated.slides[1]._element.cSld.get("name") == "PDF_ORIGINAL"
 
-    assert len(updated.slides[2].shapes) == 2
-    second_parked_picture = updated.slides[2].shapes[-1]
-    assert second_parked_picture.left < updated.slide_width
-    assert second_parked_picture.left + second_parked_picture.width > updated.slide_width
-    assert second_parked_picture.name == "PDF_ORIGINAL"
+    assert len(updated.slides[2].shapes) == 1
 
     assert len(updated.slides[3].shapes) == 1
     second_reference_slide = updated.slides[3].shapes[0]
@@ -98,3 +100,68 @@ def test_build_output_preserves_slides_inserts_pdf_reference_slides_and_appends_
     assert full_slide_picture.height == updated.slide_height
     assert full_slide_picture.name == "PDF_ORIGINAL"
     assert updated.slides[4]._element.cSld.get("name") == "PDF_ORIGINAL"
+
+
+def test_build_output_applies_qc_annotations_to_original_slides(tmp_path: Path) -> None:
+    source_pptx = tmp_path / "source-qc.pptx"
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    slide.shapes.add_textbox(0, 0, presentation.slide_width, 600000).text_frame.text = "Original slide 1"
+    presentation.save(source_pptx)
+
+    background_image = _make_png(tmp_path / "background-qc.png", size=(1600, 900), color=(250, 248, 244))
+    bundle = PlacementBundle(
+        slide_results=[
+            PagePlacementResult(
+                candidate_slide_index=0,
+                reference_page_index=0,
+                status=PlacementStatus.PLACED,
+                background_image_path=background_image,
+                message="Inserted PDF page as a full-slide reference slide after the original slide",
+            )
+        ]
+    )
+    qc_report = QcReport(
+        slide_results=[
+            SlideQcResult(
+                slide_index=0,
+                page_index=0,
+                status=SlideQcStatus.FINDINGS,
+                findings=[
+                    SlideQcFinding(
+                        finding_id=1,
+                        finding_type=QcFindingType.MISSING_CONTENT,
+                        severity=QcFindingSeverity.HIGH,
+                        bbox=(0.1, 0.12, 0.3, 0.26),
+                        message="Missing block",
+                        confidence=0.95,
+                    )
+                ],
+                summary="AI review findings",
+                comment_bullets=[
+                    "Missing logo in the top-right corner",
+                    "Accent bar color does not match the PDF reference",
+                ],
+                note="AI review findings\n- Missing logo in the top-right corner\n- Accent bar color does not match the PDF reference",
+            )
+        ],
+        counts_by_type={"missing_content": 1},
+    )
+
+    output_pptx = DeckWriter().build_output(source_pptx, bundle, tmp_path / "output-qc.pptx", qc_report=qc_report)
+
+    updated = Presentation(output_pptx)
+    original_slide = updated.slides[0]
+    shape_names = [shape.name for shape in original_slide.shapes]
+
+    assert "QC_missing_content_1" in shape_names
+    assert "QC_BADGE_1" not in shape_names
+    assert "QC_SUMMARY" in shape_names
+    summary_shape = next(shape for shape in original_slide.shapes if shape.name == "QC_SUMMARY")
+    paragraph_text = [paragraph.text for paragraph in summary_shape.text_frame.paragraphs if paragraph.text]
+    assert paragraph_text == [
+        "AI review findings",
+        "• Missing logo in the top-right corner",
+        "• Accent bar color does not match the PDF reference",
+    ]
+    assert len(updated.slides) == 2

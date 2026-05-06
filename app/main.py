@@ -3,12 +3,12 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import get_settings
-from app.schemas import CompareResponse, JobStatusResponse, PDFFontInfoResponse
+from app.schemas import CompareResponse, HealthResponse, JobStatusResponse, PDFFontInfoResponse, RendererStatusResponse
 from app.services.jobs import JobManager
 
 
@@ -35,9 +35,22 @@ async def index() -> FileResponse:
     return FileResponse(settings.static_dir / "index.html")
 
 
-@app.get("/api/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+@app.get("/api/health", response_model=HealthResponse)
+async def health(request: Request) -> HealthResponse:
+    availability = request.app.state.job_manager.renderer.availability()
+    return HealthResponse(
+        status="ok",
+        renderer=RendererStatusResponse(
+            canConvert=availability.can_convert,
+            preferredRenderer=availability.preferred_renderer,
+            libreofficeAvailable=availability.libreoffice_available,
+            powerpointAvailable=availability.powerpoint_available,
+            canExportSlideImages=availability.can_export_slide_images,
+            slideImageExportRenderer=availability.slide_image_export_renderer,
+            slideImageExportMessage=availability.slide_image_export_message,
+            message=availability.message,
+        ),
+    )
 
 
 @app.post("/api/compare", response_model=CompareResponse, status_code=202)
@@ -45,14 +58,19 @@ async def compare(
     request: Request,
     pdf: UploadFile = File(...),
     pptx: UploadFile = File(...),
+    enable_ai_qc: bool = Form(True),
 ) -> CompareResponse:
     if Path(pdf.filename or "").suffix.lower() != ".pdf":
         raise HTTPException(status_code=400, detail="The `pdf` upload must be a .pdf file.")
     if Path(pptx.filename or "").suffix.lower() != ".pptx":
         raise HTTPException(status_code=400, detail="The `pptx` upload must be a .pptx file.")
 
-    job = request.app.state.job_manager.create_job(pdf_upload=pdf, pptx_upload=pptx)
-    return CompareResponse(jobId=job.job_id, status=job.status)
+    job = request.app.state.job_manager.create_job(
+        pdf_upload=pdf,
+        pptx_upload=pptx,
+        enable_ai_qc=enable_ai_qc,
+    )
+    return CompareResponse(jobId=job.job_id, status=job.status, aiQcEnabled=job.enable_ai_qc)
 
 
 @app.get("/api/jobs/{job_id}", response_model=JobStatusResponse)
@@ -68,6 +86,7 @@ async def get_job(job_id: str, request: Request) -> JobStatusResponse:
         slideProgress=job.slide_progress,
         slideCount=job.slide_count,
         outputReady=bool(job.output_pptx_path and job.output_pptx_path.exists()),
+        aiQcEnabled=job.enable_ai_qc,
         pdfPageCount=job.pdf_page_count,
         pdfPageCharacterTotals=job.pdf_page_character_totals,
         pdfFonts=[
@@ -81,6 +100,8 @@ async def get_job(job_id: str, request: Request) -> JobStatusResponse:
             )
             for font in job.pdf_fonts
         ],
+        qcCountsByType=job.qc_counts_by_type,
+        qcManualReviewCount=job.qc_manual_review_count,
         error=job.error,
     )
 

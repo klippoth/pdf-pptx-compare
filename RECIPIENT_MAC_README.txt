@@ -15,4 +15,5 @@ What you need installed:
 
 Notes:
 - LibreOffice is used first when available
+- If LibreOffice is missing but Microsoft PowerPoint is installed, the app will use PowerPoint automatically
 - The app runs locally on your machine and opens in your browser

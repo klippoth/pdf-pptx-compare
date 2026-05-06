@@ -3,25 +3,24 @@ from __future__ import annotations
 from pathlib import Path
 
 from pptx import Presentation
-from pptx.util import Emu
 
-from app.services.models import PagePlacementResult, PlacementBundle, PlacementStatus
+from app.services.annotation_writer import AnnotationWriter
+from app.services.models import PagePlacementResult, PlacementBundle, PlacementStatus, QcReport
 
 
 class DeckWriter:
-    def __init__(
-        self,
-        parked_width_ratio: float = 0.42,
-        visible_peek_ratio: float = 0.18,
-        top_margin_ratio: float = 0.02,
-    ):
-        self.parked_width_ratio = parked_width_ratio
-        self.visible_peek_ratio = visible_peek_ratio
-        self.top_margin_ratio = top_margin_ratio
+    def __init__(self):
         self.pdf_reference_shape_name = "PDF_ORIGINAL"
         self.pdf_reference_slide_name = "PDF_ORIGINAL"
+        self.annotation_writer = AnnotationWriter()
 
-    def build_output(self, source_pptx: Path, placement_bundle: PlacementBundle, output_path: Path) -> Path:
+    def build_output(
+        self,
+        source_pptx: Path,
+        placement_bundle: PlacementBundle,
+        output_path: Path,
+        qc_report: QcReport | None = None,
+    ) -> Path:
         presentation = Presentation(str(source_pptx))
         original_slides = list(presentation.slides)
         reference_insertions: list[tuple[int, PagePlacementResult]] = []
@@ -30,13 +29,14 @@ class DeckWriter:
             if slide_index >= len(placement_bundle.slide_results):
                 break
             result = placement_bundle.slide_results[slide_index]
-            if result.background_image_path and result.status == PlacementStatus.PLACED:
-                self._add_parked_reference_picture(
+            if qc_report is not None and slide_index < len(qc_report.slide_results):
+                self.annotation_writer.apply(
                     slide=slide,
-                    image_path=result.background_image_path,
+                    slide_qc_result=qc_report.slide_results[slide_index],
                     slide_width=presentation.slide_width,
                     slide_height=presentation.slide_height,
                 )
+            if result.background_image_path and result.status == PlacementStatus.PLACED:
                 reference_insertions.append((slide_index, result))
 
         for slide_index, result in reversed(reference_insertions):
@@ -98,16 +98,7 @@ class DeckWriter:
         slide_id_list.remove(slide_id)
         slide_id_list.insert(insert_index, slide_id)
 
-    def _add_parked_reference_picture(self, slide, image_path: Path, slide_width: Emu, slide_height: Emu) -> None:
-        parked_width = max(1, int(round(slide_width * self.parked_width_ratio)))
-        parked_height = max(1, int(round(slide_height * self.parked_width_ratio)))
-        visible_peek = max(1, int(round(slide_width * self.visible_peek_ratio)))
-        left = int(slide_width - visible_peek)
-        top = int(round(slide_height * self.top_margin_ratio))
-        picture = slide.shapes.add_picture(str(image_path), left, top, width=parked_width, height=parked_height)
-        picture.name = self.pdf_reference_shape_name
-
-    def _add_full_slide_picture(self, slide, image_path: Path, slide_width: Emu, slide_height: Emu) -> None:
+    def _add_full_slide_picture(self, slide, image_path: Path, slide_width, slide_height) -> None:
         picture = slide.shapes.add_picture(str(image_path), 0, 0, width=slide_width, height=slide_height)
         picture.name = self.pdf_reference_shape_name
 

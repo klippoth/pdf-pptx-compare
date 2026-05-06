@@ -21,6 +21,19 @@ class Settings:
     powerpoint_app_path: Optional[Path] = None
     libreoffice_bin: Optional[Path] = None
     powershell_bin: str = "powershell.exe"
+    google_document_ai_project_id: Optional[str] = None
+    google_document_ai_location: Optional[str] = None
+    google_document_ai_processor_id: Optional[str] = None
+    google_document_ai_processor_version: Optional[str] = None
+    openai_api_key: Optional[str] = None
+    openai_qc_model: str = "gpt-5.3-chat-latest"
+    openai_qc_parallelism: int = 4
+    openai_qc_timeout_seconds: float = 90.0
+    prefer_powerpoint_for_ai_qc: bool = True
+    prefer_poppler_for_ai_qc: bool = True
+    poppler_bin_dir: Optional[Path] = None
+    powerpoint_slide_export_macro_name: Optional[str] = None
+    powerpoint_slide_export_staging_dir: Optional[Path] = None
 
 
 def _detect_platform_name() -> str:
@@ -95,6 +108,13 @@ def _default_enable_powerpoint_fallback(platform_name: str) -> bool:
     return platform_name == "windows"
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    if not value:
+        return default
+    return value in {"1", "true", "yes", "on"}
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     app_dir = Path(__file__).resolve().parent
@@ -115,4 +135,27 @@ def get_settings() -> Settings:
             _default_libreoffice_bin(platform_name),
         ),
         powershell_bin=os.getenv("PDF_PPTX_POWERSHELL_BIN", "powershell.exe"),
+        google_document_ai_project_id=os.getenv("PDF_PPTX_GOOGLE_DOC_AI_PROJECT_ID", "").strip() or None,
+        google_document_ai_location=os.getenv("PDF_PPTX_GOOGLE_DOC_AI_LOCATION", "").strip() or None,
+        google_document_ai_processor_id=os.getenv("PDF_PPTX_GOOGLE_DOC_AI_PROCESSOR_ID", "").strip() or None,
+        google_document_ai_processor_version=os.getenv("PDF_PPTX_GOOGLE_DOC_AI_PROCESSOR_VERSION", "").strip() or None,
+        openai_api_key=os.getenv("OPENAI_API_KEY", "").strip() or None,
+        openai_qc_model=os.getenv("PDF_PPTX_OPENAI_QC_MODEL", "gpt-5.3-chat-latest").strip() or "gpt-5.3-chat-latest",
+        openai_qc_parallelism=max(1, int(os.getenv("PDF_PPTX_OPENAI_QC_PARALLELISM", "4") or "4")),
+        openai_qc_timeout_seconds=max(10.0, float(os.getenv("PDF_PPTX_OPENAI_QC_TIMEOUT_SECONDS", "90") or "90")),
+        prefer_powerpoint_for_ai_qc=_env_flag("PDF_PPTX_PREFER_POWERPOINT_FOR_AI_QC", True),
+        prefer_poppler_for_ai_qc=_env_flag("PDF_PPTX_PREFER_POPPLER_FOR_AI_QC", True),
+        poppler_bin_dir=_path_from_env("PDF_PPTX_POPPLER_BIN_DIR", None),
+        powerpoint_slide_export_macro_name=(
+            os.getenv("PDF_PPTX_POWERPOINT_SLIDE_EXPORT_MACRO_NAME", "").strip()
+            or ("ExportSlidesToFolder" if platform_name == "darwin" else None)
+        ),
+        powerpoint_slide_export_staging_dir=_path_from_env(
+            "PDF_PPTX_POWERPOINT_SLIDE_EXPORT_STAGING_DIR",
+            (
+                _default_runtime_root(platform_name) / "powerpoint-slide-exports" / "current"
+                if platform_name == "darwin"
+                else None
+            ),
+        ),
     )

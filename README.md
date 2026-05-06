@@ -5,8 +5,7 @@ Local desktop web app for cloning an uploaded PPTX, rendering the uploaded PDF i
 ## Requirements
 
 - macOS or Windows
-- LibreOffice installed
-- Microsoft PowerPoint only if you want optional PowerPoint fallback export
+- LibreOffice or Microsoft PowerPoint installed
 - Python 3.9+
 
 ## Install
@@ -68,17 +67,25 @@ Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
 - Accepts one `.pdf` and one `.pptx`
 - Exports the PPTX to PDF with LibreOffice by default so PowerPoint does not open during normal runs
 - Supports macOS and Windows with platform-aware export defaults
-- Can optionally fall back to Microsoft PowerPoint if `PDF_PPTX_ENABLE_POWERPOINT_FALLBACK=1`
+- Automatically uses Microsoft PowerPoint when LibreOffice is not installed but PowerPoint is available on the machine
+- Can still force PowerPoint fallback behavior with `PDF_PPTX_ENABLE_POWERPOINT_FALLBACK=1`
 - Rasterizes both PDFs into page images
 - Detects fonts used in the uploaded PDF and records whether they appear embedded
-- Chooses the best PDF page rotation for each slide from `0`, `90`, and `270`
+- Runs rendered-slide QC against the exported PPTX PDF and the reference PDF
+- Uses parallelized GPT slide-by-slide image comparison when `OPENAI_API_KEY` is configured
+- Sends the rendered PDF page and the rendered PPT slide as the two image inputs for each comparison
+- On Windows, PowerPoint can export the candidate slide images directly through native PowerPoint automation; no AppleScript or VBA add-in is required there
+- On macOS, direct candidate slide-image export uses the `ExportSlidesToFolder` PowerPoint VBA macro when you want native PowerPoint slide PNGs
+- Falls back to native/OCR/visual QC only when GPT QC is not configured
+- Focuses QC on obvious mistakes: missing elements, extra elements, wrong text, wrong colors, and obvious line breaks
+- Annotates the original PPT slide with QC rectangles and a concise GPT-generated summary comment, while keeping the inserted `PDF_ORIGINAL` reference slide after it
+- Preserves the PDF page orientation instead of auto-rotating it to match the slide
 - Creates a new PPTX with the original slide content intact
-- Parks each matching PDF page as an opaque movable picture named `PDF_ORIGINAL` just off the top-right of the slide so reviewers can drag it in when needed
-- Inserts a full-slide PDF screenshot immediately after each matched PPTX slide for slide-by-slide review, with the slide name set to `PDF_ORIGINAL`
-- Bakes a red border into each parked reference image so the screenshot and its outline move as one piece
+- Inserts a full-slide PDF screenshot immediately after each matched PPTX slide for slide-by-slide review, with the slide and screenshot shape name set to `PDF_ORIGINAL`
 - Appends unmatched PDF pages as full-slide reference slides at the end of the deck
 - Returns `<original-name>_with_pdf_pages.pptx`
 - Writes a sidecar font report to `runs/<job_id>/output/pdf_fonts.json`
+- Writes a sidecar QC report to `runs/<job_id>/output/qc_report.json`
 
 ## Notes
 
@@ -87,6 +94,17 @@ Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
 - Page matching is page-index based in v1.
 - PDF pages are fit into the slide canvas without stretching. If a PDF page has a different aspect ratio, you will see padding rather than geometric distortion.
 - Runtime job files are stored in the user application-data area by default instead of the project folder, which avoids `uvicorn --reload` restarts during uploads.
+- If `OPENAI_API_KEY` is set, slide QC is driven by a GPT vision model comparing the PDF and PPT renders directly.
+- Without `OPENAI_API_KEY`, the app falls back to rule-based native/OCR/visual QC.
+
+## Windows Notes
+
+- Windows does not use the macOS AppleScript / VBA add-in path.
+- If Microsoft PowerPoint is installed on Windows, the app can:
+  - export PPTX to PDF through native PowerPoint automation
+  - export slide PNGs directly through native PowerPoint automation
+- That makes the Windows AI-comparison path simpler than the macOS setup.
+- For the strongest Windows QC path, install Microsoft PowerPoint. LibreOffice is still supported as a PDF export fallback.
 
 ## Optional Environment Overrides
 
@@ -95,6 +113,14 @@ Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
 - `PDF_PPTX_POWERPOINT_APP_PATH` overrides the macOS PowerPoint app location
 - `PDF_PPTX_POWERSHELL_BIN` overrides the Windows PowerShell executable used for PowerPoint fallback
 - `PDF_PPTX_RUNS_DIR` overrides where temporary job folders are stored
+- `PDF_PPTX_GOOGLE_DOC_AI_PROJECT_ID` enables Google Document AI OCR fallback
+- `PDF_PPTX_GOOGLE_DOC_AI_LOCATION` sets the Google Document AI processor location
+- `PDF_PPTX_GOOGLE_DOC_AI_PROCESSOR_ID` sets the Google Document AI processor ID
+- `PDF_PPTX_GOOGLE_DOC_AI_PROCESSOR_VERSION` optionally pins a processor version
+- `OPENAI_API_KEY` enables GPT-based slide QC
+- `PDF_PPTX_OPENAI_QC_MODEL` overrides the GPT model used for slide QC
+- `PDF_PPTX_OPENAI_QC_PARALLELISM` controls how many slide comparisons run in parallel
+- `PDF_PPTX_OPENAI_QC_TIMEOUT_SECONDS` sets the per-slide GPT request timeout
 
 ## Packaging For Windows Users
 
@@ -115,6 +141,7 @@ Important:
 - The packaged app still needs a renderer on the recipient machine
 - LibreOffice is used first when available
 - On Windows, PowerPoint fallback is enabled by default in packaged or normal runs, so a user with Microsoft PowerPoint installed can still export even without LibreOffice
+- On macOS, the app will also use Microsoft PowerPoint automatically if LibreOffice is missing and PowerPoint is installed
 
 ## Packaging For Mac Users
 
@@ -142,4 +169,5 @@ Important:
 
 - The packaged app still needs a renderer on the recipient machine
 - LibreOffice is used first when available
+- If LibreOffice is missing but Microsoft PowerPoint is installed, the app will use PowerPoint automatically on macOS
 - Because the app is not notarized, macOS may show a Gatekeeper warning the first time it is opened
