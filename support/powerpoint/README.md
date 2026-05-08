@@ -1,37 +1,77 @@
-# PowerPoint Native Slide Export Macro
+# PowerPoint Native Reference Slide Macro
 
-This folder contains the VBA module for a PowerPoint-native slide PNG export path on macOS.
+This folder contains the VBA module for the PowerPoint-native reference-slide insertion path on macOS.
 
 ## Why this exists
 
-The direct AppleScript command:
+The slide PNG export path is now intentionally kept separate:
 
-```applescript
-save currentPresentation in outputPath as save as PNG
-```
+- `ImageExport.ppam`
+  Owns the simple, reliable slide-image export macro:
 
-is unreliable on newer macOS / Office builds. The more promising native PowerPoint path is VBA:
+  ```vb
+  Sub ExportSlidesToFolder(folderPath As String)
+      Dim sld As Slide
+      Dim sName As String
+      Dim fullPath As String
 
-```vb
-Presentation.Export Path:="...", FilterName:="PNG", ScaleWidth:=1400, ScaleHeight:=788
-```
+      If Right(folderPath, 1) <> "/" Then folderPath = folderPath & "/"
+
+      For Each sld In ActivePresentation.Slides
+          sName = "Slide_" & sld.SlideIndex & ".png"
+          fullPath = folderPath & sName
+          sld.Export fullPath, "PNG"
+      Next sld
+  End Sub
+  ```
+
+- `PDF-PPT_Helper.ppam`
+  Owns only the reference-slide insertion macro:
+
+  - `InsertReferenceSlidesFromManifest`
+
+This split avoids having two add-ins define `ExportSlidesToFolder`, which turned out to be fragile on Mac PowerPoint.
 
 ## Intended usage
 
-1. Create a PowerPoint add-in (`.ppam`) or macro-enabled deck (`.pptm`).
-2. Import [`SlideExport.bas`](./SlideExport.bas) into that VBA project.
-3. Load the add-in in PowerPoint.
-4. Invoke it from AppleScript with PowerPoint's `run VB macro` command.
+1. Keep `ImageExport.ppam` loaded in PowerPoint for slide PNG export.
+2. Import [`SlideExport.bas`](./SlideExport.bas) into `PDF-PPT_Helper.ppam` or another helper add-in.
+3. Load that helper add-in in PowerPoint too.
+4. Invoke the macros from AppleScript with PowerPoint's `run VB macro` command.
 
-Example AppleScript shape:
+For slide-image export, the app calls the export add-in's simple macro:
 
 ```applescript
 tell application "Microsoft PowerPoint"
-    set exportResult to run VB macro macro name "SlideExport.ExportSlidesAsPng" ¬
-        list of parameters {inputPath, outputFolder, "1400", "788"}
+    run VB macro macro name "ExportSlidesToFolder" ¬
+        list of parameters {outputFolder}
 end tell
 ```
 
-## Current blocker
+For reference-slide insertion, the app calls:
 
-The app can call a PowerPoint VBA macro once the macro exists, but it does not yet create the `.ppam` automatically. PowerPoint VBA projects are compiled binary artifacts, so a real add-in must be created once inside PowerPoint.
+```applescript
+tell application "Microsoft PowerPoint"
+    run VB macro macro name "InsertReferenceSlidesFromManifest" ¬
+        list of parameters {manifestPath}
+end tell
+```
+
+For manual validation inside a `.pptm`, the helper module includes:
+
+- `TestInsertReferenceSlidesFromManifest`
+
+The export add-in should keep its own:
+
+- `TestExportSlidesToFolder`
+
+The manifest is a tab-delimited text file written by the app. Each line contains:
+
+```text
+INSERT    <zero-based-slide-index>    /absolute/path/to/reference-image.png
+APPEND        /absolute/path/to/reference-image.png
+```
+
+## Important note
+
+The app can call a PowerPoint VBA macro once the macro exists, but it does not create the `.ppam` automatically. PowerPoint VBA projects are compiled binary artifacts, so a real add-in must still be created once inside PowerPoint and updated when this module changes.

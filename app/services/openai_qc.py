@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
+from difflib import SequenceMatcher
 from io import BytesIO
+import json
 from pathlib import Path
+import re
+import hashlib
 from typing import Literal, Optional
+import unicodedata
 
 from PIL import Image
 from pydantic import BaseModel, Field
 
 from app.services.models import (
+    ParagraphLayout,
+    TextLayout,
     PageImage,
     QcFindingSeverity,
     QcFindingType,
@@ -18,9 +26,78 @@ from app.services.models import (
     TextSource,
 )
 
+DEFAULT_GENERAL_SYSTEM_PROMPT = (
+    "You are a slide quality-control reviewer focused on obvious visual discrepancies. Compare a "
+    "reference PDF page image against a candidate PowerPoint slide render. The PDF reference is "
+    "always the source of truth. Report only obvious visual content mistakes in these categories: "
+    "missing_content, extra_content, wrong_color, and line_break_issue. "
+    "Treat missing_content as shapes or elements present in the reference but absent in the "
+    "candidate. Treat extra_content as shapes or elements that appear in the candidate but should "
+    "not be there. Treat wrong_color only as a significant and obvious font/text color mismatch on readable text. "
+    "Do not report general fill, accent, image, or chart color differences. Treat line_break_issue "
+    "only as an unmistakable visual wrap or split. Ignore wrong_text in this pass entirely. Do not "
+    "report chart size/position, alignment, or positioning issues in this pass. "
+    "Work methodically: compare the two full-slide images, scan them top-to-bottom and left-to-right, "
+    "then re-check every finding against the full images before returning it. Ignore subtle layout drift, "
+    "tiny spacing changes, minor font changes, and negligible rendering noise. Return bounding boxes "
+    "in normalized candidate-image coordinates [x0, y0, x1, y1] between 0 and 1."
+)
+
+DEFAULT_GENERAL_USER_PROMPT = (
+    "Image 1 is the full candidate PowerPoint slide. Image 2 is the full reference PDF "
+    "page. Focus on obvious missing shapes/elements, extra elements, significant obvious font/text color "
+    "mismatches on readable text, and obvious line-break/render splits only. Do "
+    "not report text spelling or wording issues in this pass."
+)
+
+DEFAULT_TEXT_SYSTEM_PROMPT = (
+    "You are a slide quality-control reviewer focused only on visible text discrepancies. Compare "
+    "a reference PDF page image against a candidate PowerPoint slide render. The PDF reference is "
+    "always the source of truth. Report only wrong_text findings in this pass. Treat wrong_text "
+    "as clearly visible differences in wording, spelling, typos, names, dates, numbers, "
+    "punctuation, capitalization when meaningful, or missing/extra text. Spell-check visible text "
+    "carefully against the reference, especially names, company names, presenter names, titles, "
+    "dates, and numbers. "
+    "Obvious readable typos and misspellings should be treated as high-signal wrong_text findings, "
+    "even if only one or two characters differ. Use any extracted text and deterministic text-diff "
+    "checklist as strong evidence, but still verify against the images before returning a finding. "
+    "If a deterministic text-diff checklist is provided, only report wrong_text findings that match "
+    "one of those listed mismatches or another clearly extracted-text mismatch visible in both image "
+    "and text evidence. If the extracted texts match, do not invent a typo correction. "
+    "Internally review the slide in ordered passes from top to bottom and left to right. For text "
+    "verification, check suspicious lines one by one and compare each candidate line directly against "
+    "the matching reference line before returning a finding. Also verify every proposed finding a second "
+    "time before returning it. Do not proofread, rewrite, improve grammar, or suggest better phrasing. "
+    "Do not normalize wording. Ignore color, shapes, charts, and general layout drift in this pass. "
+    "Return bounding boxes in normalized candidate-image coordinates [x0, y0, x1, y1] between 0 and 1."
+)
+
+DEFAULT_TEXT_USER_PROMPT = (
+    "Image 1 is the candidate PowerPoint slide. Image 2 is the reference PDF page. "
+    "Review only visible text discrepancies. Check these areas in order: titles, "
+    "subtitles, body text, footer text, presenter names, dates, and numbers, scanning "
+    "from top to bottom and left to right. If a "
+    "deterministic text-diff checklist is provided, treat it as a prioritized list of "
+    "suspected text issues to confirm or reject. Work through those suspicious text "
+    "items line by line, and only report wrong_text if it aligns "
+    "with one of those mismatches or another clear extracted-text mismatch. If readable visible text differs by one or "
+    "more letters, digits, or punctuation marks, treat it as wrong_text. This includes "
+    "obvious typos, misspellings, dropped letters, extra letters, swapped letters, and "
+    "repeated letters. If a region looks the same in both images on the second check, do "
+    "not report a discrepancy there. Do not correct grammar, normalize wording, or call "
+    "out preferred wording. Do not infer what the text probably meant."
+)
+
+PROMPT_CONFIG_KEYS = (
+    "general_system_prompt",
+    "general_user_prompt",
+    "text_system_prompt",
+    "text_user_prompt",
+)
+
 
 class _FindingSchema(BaseModel):
-    type: Literal["missing_content", "extra_content", "wrong_text", "wrong_color", "line_break_issue"]
+    type: Literal["missing_content", "extra_content", "wrong_text", "wrong_color", "line_break_issue", "size_position_issue"]
     severity: Literal["high", "medium", "low"] = "medium"
     message: str
     confidence: float = Field(ge=0.0, le=1.0)
@@ -36,6 +113,25 @@ class _SlideQcSchema(BaseModel):
     findings: list[_FindingSchema] = Field(default_factory=list)
 
 
+@dataclass
+class _TextDiscrepancySupport:
+    candidate_bbox: tuple[float, float, float, float]
+    reference_bbox: tuple[float, float, float, float]
+    reference_text: str
+    candidate_text: str
+    text_score: float
+    position_score: float
+    label: str
+
+
+@dataclass
+class _CanvasFit:
+    source_size: tuple[int, int]
+    target_size: tuple[int, int]
+    fitted_size: tuple[int, int]
+    offset: tuple[int, int]
+
+
 class OpenAIQCEvaluator:
     def __init__(
         self,
@@ -43,7 +139,7 @@ class OpenAIQCEvaluator:
         api_key: Optional[str],
         model: str = "gpt-5.3-chat-latest",
         timeout_seconds: float = 90.0,
-        max_image_dimension: int = 1400,
+        max_image_dimension: int = 0,
         client=None,
     ):
         self.api_key = api_key
@@ -55,6 +151,15 @@ class OpenAIQCEvaluator:
     def is_available(self) -> bool:
         return bool(self.api_key or self._client is not None)
 
+    @classmethod
+    def get_default_prompt_config(cls) -> dict[str, str]:
+        return {
+            "general_system_prompt": DEFAULT_GENERAL_SYSTEM_PROMPT,
+            "general_user_prompt": DEFAULT_GENERAL_USER_PROMPT,
+            "text_system_prompt": DEFAULT_TEXT_SYSTEM_PROMPT,
+            "text_user_prompt": DEFAULT_TEXT_USER_PROMPT,
+        }
+
     def compare_pages(
         self,
         *,
@@ -62,42 +167,96 @@ class OpenAIQCEvaluator:
         page_index: int,
         reference_page: PageImage,
         candidate_page: PageImage,
+        reference_layout: Optional[TextLayout] = None,
+        candidate_layout: Optional[TextLayout] = None,
         debug_output_dir: Optional[Path] = None,
+        prompt_override: Optional[str] = None,
+        prompt_config: Optional[dict[str, str]] = None,
     ) -> SlideQcResult:
-        parsed = self._invoke_model(
-            reference_page=reference_page,
+        candidate_image, reference_image, reference_fit = self._prepare_comparison_images(
             candidate_page=candidate_page,
-            debug_output_dir=debug_output_dir,
+            reference_page=reference_page,
         )
-        findings: list[SlideQcFinding] = []
-        for finding in parsed.findings:
-            finding_type = QcFindingType(finding.type)
-            severity = QcFindingSeverity(finding.severity)
-            bbox = self._normalize_bbox(finding.bbox)
-            findings.append(
-                SlideQcFinding(
-                    finding_id=len(findings) + 1,
-                    finding_type=finding_type,
-                    severity=severity,
-                    bbox=bbox,
-                    message=finding.message.strip(),
-                    confidence=max(0.0, min(1.0, float(finding.confidence))),
-                )
+        text_discrepancies = self._collect_text_discrepancies(
+            reference_layout=reference_layout,
+            candidate_layout=candidate_layout,
+        )
+        candidate_text_regions = self._collect_candidate_text_regions(candidate_layout)
+        text_context = self._build_text_context(
+            reference_layout=reference_layout,
+            candidate_layout=candidate_layout,
+            text_discrepancies=text_discrepancies,
+        )
+        if debug_output_dir is not None:
+            self._save_debug_inputs(
+                debug_output_dir=debug_output_dir,
+                candidate_image=candidate_image,
+                reference_image=reference_image,
+                prompt_override=prompt_override,
+                prompt_config=prompt_config,
             )
 
-        status = SlideQcStatus(parsed.status)
-        if status == SlideQcStatus.OK and findings:
-            status = SlideQcStatus.FINDINGS
-        if status == SlideQcStatus.FINDINGS and not findings:
-            status = SlideQcStatus.OK
-        summary, bullets, note = self._final_comment(parsed.summary, parsed.bullets, parsed.note, findings)
+        general_parsed = self._invoke_general_model(
+            candidate_image=candidate_image,
+            reference_image=reference_image,
+            prompt_override=prompt_override,
+            prompt_config=prompt_config,
+        )
+        text_parsed = self._invoke_text_model(
+            candidate_image=candidate_image,
+            reference_image=reference_image,
+            text_context=text_context,
+            text_discrepancies=text_discrepancies,
+            reference_fit=reference_fit,
+            prompt_override=prompt_override,
+            prompt_config=prompt_config,
+        )
+
+        kept_general_findings = self._materialize_findings(
+            general_parsed.findings,
+            allowed_types={
+                QcFindingType.MISSING_CONTENT,
+                QcFindingType.EXTRA_CONTENT,
+                QcFindingType.WRONG_COLOR,
+                QcFindingType.LINE_BREAK_ISSUE,
+            },
+            next_finding_id=1,
+        )
+        kept_general_findings = self._filter_general_findings(
+            kept_general_findings,
+            candidate_text_regions=candidate_text_regions,
+        )
+        kept_text_findings = self._filter_text_findings_against_support(
+            self._materialize_findings(
+                text_parsed.findings,
+                allowed_types={QcFindingType.WRONG_TEXT},
+                next_finding_id=len(kept_general_findings) + 1,
+            ),
+            text_discrepancies=text_discrepancies,
+        )
+        findings: list[SlideQcFinding] = []
+        findings.extend(kept_general_findings)
+        findings.extend(kept_text_findings)
+        findings = self._deduplicate_findings(findings)
+        for finding_id, finding in enumerate(findings, start=1):
+            finding.finding_id = finding_id
+
+        status = self._merge_statuses(general_parsed.status, text_parsed.status, findings)
+        summary, bullets, note = self._merge_comments(
+            general_result=general_parsed,
+            text_result=text_parsed,
+            general_kept_findings=kept_general_findings,
+            text_kept_findings=kept_text_findings,
+            findings=findings,
+        )
+        comparison_confidence = (float(general_parsed.comparison_confidence) + float(text_parsed.comparison_confidence)) / 2.0
 
         return SlideQcResult(
             slide_index=slide_index,
             page_index=page_index,
             status=status,
             findings=findings,
-            alignment_confidence=max(0.0, min(1.0, float(parsed.comparison_confidence))),
+            alignment_confidence=max(0.0, min(1.0, comparison_confidence)),
             reference_source=TextSource.MODEL,
             candidate_source=TextSource.MODEL,
             summary=summary,
@@ -105,101 +264,141 @@ class OpenAIQCEvaluator:
             note=note,
         )
 
-    def _invoke_model(
+    def _invoke_general_model(
         self,
         *,
-        reference_page: PageImage,
-        candidate_page: PageImage,
-        debug_output_dir: Optional[Path] = None,
+        candidate_image: Image.Image,
+        reference_image: Image.Image,
+        prompt_override: Optional[str] = None,
+        prompt_config: Optional[dict[str, str]] = None,
     ) -> _SlideQcSchema:
-        client = self._get_client()
-        candidate_image, reference_image = self._prepare_comparison_images(
-            candidate_page=candidate_page,
-            reference_page=reference_page,
-        )
-        if debug_output_dir is not None:
-            self._save_debug_inputs(
-                debug_output_dir=debug_output_dir,
-                candidate_image=candidate_image,
-                reference_image=reference_image,
-            )
-        response = client.responses.parse(
-            model=self.model,
-            input=[
+        additional_instructions = self._format_prompt_override(prompt_override)
+        resolved_prompt_config = self._resolve_prompt_config(prompt_config)
+        return self._parse_model_response(
+            input_content=[
                 {
                     "role": "system",
-                    "content": (
-                        "You are a slide quality-control reviewer. Compare a reference PDF page image against a "
-                        "candidate PowerPoint slide render. The PDF reference is always the source of truth. "
-                        "Your job is to comment only on obvious content mistakes. Only report findings in these "
-                        "five categories: missing_content, extra_content, wrong_text, wrong_color, and "
-                        "line_break_issue. Treat missing_content as shapes or elements that are present in the "
-                        "reference but absent in the candidate. Treat extra_content as shapes or elements that "
-                        "appear in the candidate but should not be there. Treat wrong_text as clearly incorrect "
-                        "wording, numbers, or labels. Treat line_break_issue only as an obvious wrap/split where "
-                        "the same text should stay on one line or block in the candidate. "
-                        "Do not report size_position_issue, alignment drift, subtle layout drift, tiny spacing "
-                        "changes, minor font differences, tiny kerning changes, mild rendering noise, or negligible "
-                        "sub-pixel shifts. If a difference is borderline, ignore it. "
-                        "Return bounding boxes in normalized candidate-image coordinates [x0, y0, x1, y1] "
-                        "between 0 and 1. Provide a short summary plus a bullet list. Each bullet should describe "
-                        "one obvious issue with a bit of location or context. Use manual_review only if the images "
-                        "are too ambiguous to compare."
-                    ),
+                    "content": resolved_prompt_config["general_system_prompt"] + additional_instructions,
                 },
                 {
                     "role": "user",
                     "content": [
                         {
                             "type": "input_text",
-                            "text": (
-                                "Image 1 is the candidate PowerPoint slide. Image 2 is the reference PDF page. "
-                                "Both images have been normalized to the same canvas size for easier comparison. "
-                                "Compare them visually, page by page. "
-                                "Focus only on: missing shapes/elements, shapes that should not be there, clearly "
-                                "wrong text, obviously wrong colors, and obvious line breaks where the text should "
-                                "stay together. Ignore all subtle alignment, positioning, sizing, spacing, or font "
-                                "differences. If a line break call is not extremely clear visually, do not report it. "
-                                "Use Image 1 for the returned bounding boxes. If there are obvious "
-                                "issues, write them as concise bullets with a little more detail than a label alone. "
-                                "If there are no obvious issues, say so."
-                            ),
+                            "text": resolved_prompt_config["general_user_prompt"],
                         },
+                        *self._prompt_override_content(prompt_override),
                         {"type": "input_image", "image_url": self._image_to_data_url(candidate_image)},
                         {"type": "input_image", "image_url": self._image_to_data_url(reference_image)},
                     ],
                 },
-            ],
+            ]
+        )
+
+    def _invoke_text_model(
+        self,
+        *,
+        candidate_image: Image.Image,
+        reference_image: Image.Image,
+        text_context: str,
+        text_discrepancies: list[_TextDiscrepancySupport],
+        reference_fit: _CanvasFit,
+        prompt_override: Optional[str] = None,
+        prompt_config: Optional[dict[str, str]] = None,
+    ) -> _SlideQcSchema:
+        additional_instructions = self._format_prompt_override(prompt_override)
+        resolved_prompt_config = self._resolve_prompt_config(prompt_config)
+        discrepancy_content = self._build_text_discrepancy_content(
+            candidate_image=candidate_image,
+            reference_image=reference_image,
+            text_discrepancies=text_discrepancies,
+            reference_fit=reference_fit,
+        )
+        return self._parse_model_response(
+            input_content=[
+                {
+                    "role": "system",
+                    "content": resolved_prompt_config["text_system_prompt"] + additional_instructions,
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": resolved_prompt_config["text_user_prompt"],
+                        },
+                        *self._prompt_override_content(prompt_override),
+                        {
+                            "type": "input_text",
+                            "text": text_context,
+                        },
+                        {"type": "input_image", "image_url": self._image_to_data_url(candidate_image)},
+                        {"type": "input_image", "image_url": self._image_to_data_url(reference_image)},
+                        *discrepancy_content,
+                    ],
+                },
+            ]
+        )
+
+    def _parse_model_response(
+        self,
+        *,
+        input_content: list[dict],
+    ) -> _SlideQcSchema:
+        client = self._get_client(fresh=True)
+        response = client.responses.parse(
+            model=self.model,
+            input=input_content,
             text_format=_SlideQcSchema,
             timeout=self.timeout_seconds,
         )
         return response.output_parsed
 
-    def _get_client(self):
+    def _get_client(self, *, fresh: bool = False):
         if self._client is not None:
             return self._client
+        if not fresh and getattr(self, "_cached_client", None) is not None:
+            return self._cached_client
         from openai import OpenAI
 
-        self._client = OpenAI(api_key=self.api_key, timeout=self.timeout_seconds, max_retries=2)
-        return self._client
+        client = OpenAI(api_key=self.api_key, timeout=self.timeout_seconds, max_retries=2)
+        if not fresh:
+            self._cached_client = client
+        return client
+
+    @classmethod
+    def _resolve_prompt_config(cls, prompt_config: Optional[dict[str, str]]) -> dict[str, str]:
+        defaults = cls.get_default_prompt_config()
+        if not prompt_config:
+            return defaults
+        resolved = defaults.copy()
+        for key in PROMPT_CONFIG_KEYS:
+            value = prompt_config.get(key)
+            if isinstance(value, str) and value.strip():
+                resolved[key] = value.strip()
+        return resolved
 
     def _prepare_comparison_images(
         self,
         *,
         candidate_page: PageImage,
         reference_page: PageImage,
-    ) -> tuple[Image.Image, Image.Image]:
+    ) -> tuple[Image.Image, Image.Image, _CanvasFit]:
         candidate_source = Image.fromarray(candidate_page.image)
         reference_source = Image.fromarray(reference_page.image)
 
         candidate_scaled = self._scale_image(candidate_source)
         reference_scaled = self._scale_image(reference_source)
+        reference_canvas, reference_fit = self._fit_image_to_canvas(reference_scaled, candidate_scaled.size)
         return (
             candidate_scaled,
-            self._fit_image_to_canvas(reference_scaled, candidate_scaled.size),
+            reference_canvas,
+            reference_fit,
         )
 
     def _scale_image(self, image: Image.Image) -> Image.Image:
+        if self.max_image_dimension <= 0:
+            return image
         max_side = max(image.size)
         if max_side <= self.max_image_dimension:
             return image
@@ -211,7 +410,7 @@ class OpenAIQCEvaluator:
         return image.resize(target_size, Image.Resampling.LANCZOS)
 
     @staticmethod
-    def _fit_image_to_canvas(image: Image.Image, target_size: tuple[int, int]) -> Image.Image:
+    def _fit_image_to_canvas(image: Image.Image, target_size: tuple[int, int]) -> tuple[Image.Image, _CanvasFit]:
         canvas = Image.new("RGB", target_size, (255, 255, 255))
         scale = min(target_size[0] / image.width, target_size[1] / image.height)
         fitted_size = (
@@ -222,39 +421,434 @@ class OpenAIQCEvaluator:
         paste_x = (target_size[0] - fitted_size[0]) // 2
         paste_y = (target_size[1] - fitted_size[1]) // 2
         canvas.paste(fitted, (paste_x, paste_y))
-        return canvas
+        return canvas, _CanvasFit(
+            source_size=image.size,
+            target_size=target_size,
+            fitted_size=fitted_size,
+            offset=(paste_x, paste_y),
+        )
 
     def _image_to_data_url(self, image: Image.Image) -> str:
-        buffer = BytesIO()
-        image.save(buffer, format="PNG", optimize=True)
-        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        encoded = base64.b64encode(self._image_to_png_bytes(image)).decode("ascii")
         return f"data:image/png;base64,{encoded}"
 
     @staticmethod
+    def _image_to_png_bytes(image: Image.Image) -> bytes:
+        buffer = BytesIO()
+        image.save(buffer, format="PNG", optimize=True)
+        return buffer.getvalue()
+
+    def _build_text_discrepancy_content(
+        self,
+        *,
+        candidate_image: Image.Image,
+        reference_image: Image.Image,
+        text_discrepancies: list[_TextDiscrepancySupport],
+        reference_fit: _CanvasFit,
+        max_items: int = 8,
+    ) -> list[dict]:
+        content: list[dict] = []
+        for index, discrepancy in enumerate(text_discrepancies[:max_items], start=1):
+            candidate_crop = self._crop_to_bbox(candidate_image, self._expand_bbox(discrepancy.candidate_bbox, margin=0.02, min_size=0.08))
+            reference_canvas_bbox = self._map_bbox_to_canvas(discrepancy.reference_bbox, reference_fit)
+            reference_crop = self._crop_to_bbox(reference_image, self._expand_bbox(reference_canvas_bbox, margin=0.02, min_size=0.08))
+            content.extend(
+                [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            f"Suspicious text diff {index} ({discrepancy.label}). "
+                            f'Reference reads "{self._trim_text(discrepancy.reference_text, max_length=100)}". '
+                            f'Candidate reads "{self._trim_text(discrepancy.candidate_text, max_length=100)}". '
+                            "The next image is the candidate text crop and the image after that is the reference text crop for the matching region."
+                        ),
+                    },
+                    {"type": "input_image", "image_url": self._image_to_data_url(candidate_crop)},
+                    {"type": "input_image", "image_url": self._image_to_data_url(reference_crop)},
+                ]
+            )
+        return content
+
+    def _materialize_findings(
+        self,
+        raw_findings: list[_FindingSchema],
+        *,
+        allowed_types: set[QcFindingType],
+        next_finding_id: int,
+    ) -> list[SlideQcFinding]:
+        findings: list[SlideQcFinding] = []
+        current_id = next_finding_id
+        for finding in raw_findings:
+            finding_type = QcFindingType(finding.type)
+            if finding_type not in allowed_types:
+                continue
+            findings.append(
+                SlideQcFinding(
+                    finding_id=current_id,
+                    finding_type=finding_type,
+                    severity=QcFindingSeverity(finding.severity),
+                    bbox=self._normalize_bbox(finding.bbox),
+                    message=finding.message.strip(),
+                    confidence=max(0.0, min(1.0, float(finding.confidence))),
+                )
+            )
+            current_id += 1
+        return findings
+
+    def _filter_general_findings(
+        self,
+        findings: list[SlideQcFinding],
+        *,
+        candidate_text_regions: list[tuple[float, float, float, float]],
+    ) -> list[SlideQcFinding]:
+        kept: list[SlideQcFinding] = []
+        for finding in findings:
+            if finding.finding_type == QcFindingType.SIZE_POSITION_ISSUE:
+                continue
+            if finding.finding_type == QcFindingType.WRONG_COLOR:
+                if finding.confidence < 0.9:
+                    continue
+                if not candidate_text_regions:
+                    continue
+                if not any(self._text_color_finding_matches_region(finding, bbox) for bbox in candidate_text_regions):
+                    continue
+            kept.append(finding)
+        return kept
+
+    def _text_color_finding_matches_region(
+        self,
+        finding: SlideQcFinding,
+        bbox: tuple[float, float, float, float],
+    ) -> bool:
+        if self._bbox_iou(finding.bbox, bbox) >= 0.08:
+            return True
+        return self._bbox_contains_point(bbox, self._bbox_center(finding.bbox))
+
+    def _filter_text_findings_against_support(
+        self,
+        findings: list[SlideQcFinding],
+        *,
+        text_discrepancies: list[_TextDiscrepancySupport],
+    ) -> list[SlideQcFinding]:
+        if not text_discrepancies:
+            return []
+        kept: list[SlideQcFinding] = []
+        for finding in findings:
+            if any(self._text_finding_matches_support(finding, support) for support in text_discrepancies):
+                kept.append(finding)
+        return kept
+
+    def _text_finding_matches_support(
+        self,
+        finding: SlideQcFinding,
+        support: _TextDiscrepancySupport,
+    ) -> bool:
+        if self._bbox_iou(finding.bbox, support.candidate_bbox) >= 0.08:
+            return True
+        if self._bbox_contains_point(support.candidate_bbox, self._bbox_center(finding.bbox)):
+            return True
+        return self._region_label(finding.bbox) == self._region_label(support.candidate_bbox)
+
+    def _deduplicate_findings(self, findings: list[SlideQcFinding]) -> list[SlideQcFinding]:
+        deduped: list[SlideQcFinding] = []
+        for finding in findings:
+            match_index = next(
+                (
+                    index
+                    for index, existing in enumerate(deduped)
+                    if existing.finding_type == finding.finding_type and self._bbox_iou(existing.bbox, finding.bbox) >= 0.82
+                ),
+                None,
+            )
+            if match_index is None:
+                deduped.append(finding)
+                continue
+            existing = deduped[match_index]
+            if finding.confidence > existing.confidence:
+                deduped[match_index] = finding
+        return deduped
+
+    def _build_text_context(
+        self,
+        *,
+        reference_layout: Optional[TextLayout],
+        candidate_layout: Optional[TextLayout],
+        text_discrepancies: list[_TextDiscrepancySupport],
+    ) -> str:
+        return (
+            "Structured text extracted from the two sources is provided below. "
+            "Use it as strong evidence for wording, spelling, and number discrepancies while still checking the images. "
+            "Review suspicious text items line by line.\n\n"
+            f"Potential text discrepancies from deterministic diff:\n{self._format_text_discrepancies(text_discrepancies)}\n\n"
+            f"Candidate PowerPoint text:\n{self._format_layout(candidate_layout)}\n\n"
+            f"Reference PDF text:\n{self._format_layout(reference_layout)}"
+        )
+
+    def _format_layout(self, layout: Optional[TextLayout], *, max_items: int = 36) -> str:
+        text_items = self._text_items(layout)
+        if not text_items:
+            return "- No extracted text available."
+
+        ordered = sorted(text_items, key=lambda item: (item.bbox[1], item.bbox[0]))[:max_items]
+        lines: list[str] = []
+        for item in ordered:
+            lines.append(f"- {self._region_label(item.bbox)}: {self._trim_text(item.text)}")
+        if len(text_items) > max_items:
+            lines.append(f"- ... {len(text_items) - max_items} more text blocks omitted")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _region_label(bbox) -> str:
+        x_center = (bbox[0] + bbox[2]) / 2.0
+        y_center = (bbox[1] + bbox[3]) / 2.0
+        vertical = "top" if y_center < 0.33 else "middle" if y_center < 0.66 else "bottom"
+        horizontal = "left" if x_center < 0.33 else "center" if x_center < 0.66 else "right"
+        return f"{vertical}-{horizontal}"
+
+    @staticmethod
+    def _trim_text(text: str, *, max_length: int = 180) -> str:
+        compact = " ".join(text.split())
+        if len(compact) <= max_length:
+            return compact
+        return compact[: max_length - 1].rstrip() + "…"
+
+    def _format_text_discrepancies(
+        self,
+        text_discrepancies: list[_TextDiscrepancySupport],
+    ) -> str:
+        items: list[str] = []
+        for discrepancy in text_discrepancies:
+            items.append(
+                f"- {self._region_label(discrepancy.reference_bbox)} ({discrepancy.label}): "
+                f'reference="{self._trim_text(discrepancy.reference_text, max_length=120)}" | '
+                f'candidate="{self._trim_text(discrepancy.candidate_text, max_length=120)}"'
+            )
+        return "\n".join(items) if items else "- No obvious deterministic text mismatches detected."
+
+    def _collect_text_discrepancies(
+        self,
+        *,
+        reference_layout: Optional[TextLayout],
+        candidate_layout: Optional[TextLayout],
+        max_items: int = 12,
+    ) -> list[_TextDiscrepancySupport]:
+        if reference_layout is None or candidate_layout is None:
+            return []
+        reference_items = self._text_items(reference_layout)
+        candidate_items = self._text_items(candidate_layout)
+        if not reference_items or not candidate_items:
+            return []
+
+        matches = self._match_text_blocks(reference_items, candidate_items)
+        items: list[_TextDiscrepancySupport] = []
+        for reference_item, candidate_item, text_score, position_score in matches:
+            reference_text = self._normalize_text(reference_item.text)
+            candidate_text = self._normalize_text(candidate_item.text)
+            if not reference_text or not candidate_text or reference_text == candidate_text:
+                continue
+            if text_score < 0.58 and position_score < 0.82:
+                continue
+            label = "likely line-level typo/spelling difference" if text_score >= 0.82 else "line-level text mismatch"
+            items.append(
+                _TextDiscrepancySupport(
+                    candidate_bbox=self._normalize_bbox(list(candidate_item.bbox)),
+                    reference_bbox=self._normalize_bbox(list(reference_item.bbox)),
+                    reference_text=reference_item.text,
+                    candidate_text=candidate_item.text,
+                    text_score=text_score,
+                    position_score=position_score,
+                    label=label,
+                )
+            )
+            if len(items) >= max_items:
+                break
+        return items
+
+    def _collect_candidate_text_regions(
+        self,
+        candidate_layout: Optional[TextLayout],
+    ) -> list[tuple[float, float, float, float]]:
+        if candidate_layout is None:
+            return []
+        return [self._normalize_bbox(list(item.bbox)) for item in self._text_items(candidate_layout) if item.text.strip()]
+
+    def _match_text_blocks(
+        self,
+        reference_paragraphs: list[ParagraphLayout | TextBox],
+        candidate_paragraphs: list[ParagraphLayout | TextBox],
+    ) -> list[tuple[ParagraphLayout | TextBox, ParagraphLayout | TextBox, float, float]]:
+        ordered_reference = sorted(reference_paragraphs, key=lambda item: (item.bbox[1], item.bbox[0]))
+        ordered_candidate = sorted(candidate_paragraphs, key=lambda item: (item.bbox[1], item.bbox[0]))
+        used_candidate_indexes: set[int] = set()
+        matches: list[tuple[ParagraphLayout | TextBox, ParagraphLayout | TextBox, float, float]] = []
+
+        for reference_paragraph in ordered_reference:
+            normalized_reference = self._normalize_text(reference_paragraph.text)
+            if not normalized_reference:
+                continue
+
+            best_index = -1
+            best_score = -1.0
+            best_text_score = 0.0
+            best_position_score = 0.0
+
+            for candidate_index, candidate_paragraph in enumerate(ordered_candidate):
+                if candidate_index in used_candidate_indexes:
+                    continue
+                normalized_candidate = self._normalize_text(candidate_paragraph.text)
+                if not normalized_candidate:
+                    continue
+
+                text_score = SequenceMatcher(None, normalized_reference, normalized_candidate).ratio()
+                position_score = self._position_similarity(reference_paragraph.bbox, candidate_paragraph.bbox)
+                combined_score = (text_score * 0.55) + (position_score * 0.45)
+                if self._region_label(reference_paragraph.bbox) == self._region_label(candidate_paragraph.bbox):
+                    combined_score += 0.04
+
+                if combined_score > best_score:
+                    best_index = candidate_index
+                    best_score = combined_score
+                    best_text_score = text_score
+                    best_position_score = position_score
+
+            if best_index >= 0:
+                used_candidate_indexes.add(best_index)
+                matches.append(
+                    (
+                        reference_paragraph,
+                        ordered_candidate[best_index],
+                        best_text_score,
+                        best_position_score,
+                    )
+                )
+
+        return matches
+
+    @staticmethod
+    def _text_items(layout: Optional[TextLayout]) -> list[ParagraphLayout | TextBox]:
+        if layout is None:
+            return []
+        if layout.lines:
+            return [line for line in layout.lines if line.text.strip()]
+        return [paragraph for paragraph in layout.paragraphs if paragraph.text.strip()]
+
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        normalized = unicodedata.normalize("NFKC", value or "")
+        normalized = normalized.replace("’", "'").replace("“", '"').replace("”", '"').replace("–", "-").replace("—", "-")
+        normalized = re.sub(r"\s+", " ", normalized)
+        return normalized.strip().casefold()
+
+    @staticmethod
+    def _position_similarity(reference_bbox, candidate_bbox) -> float:
+        reference_center_x = (reference_bbox[0] + reference_bbox[2]) / 2.0
+        reference_center_y = (reference_bbox[1] + reference_bbox[3]) / 2.0
+        candidate_center_x = (candidate_bbox[0] + candidate_bbox[2]) / 2.0
+        candidate_center_y = (candidate_bbox[1] + candidate_bbox[3]) / 2.0
+        distance = ((reference_center_x - candidate_center_x) ** 2 + (reference_center_y - candidate_center_y) ** 2) ** 0.5
+        return max(0.0, 1.0 - (distance / 1.2))
+
+    @staticmethod
+    def _map_bbox_to_canvas(bbox: tuple[float, float, float, float], fit: _CanvasFit) -> tuple[float, float, float, float]:
+        x0 = ((bbox[0] * fit.fitted_size[0]) + fit.offset[0]) / max(fit.target_size[0], 1)
+        y0 = ((bbox[1] * fit.fitted_size[1]) + fit.offset[1]) / max(fit.target_size[1], 1)
+        x1 = ((bbox[2] * fit.fitted_size[0]) + fit.offset[0]) / max(fit.target_size[0], 1)
+        y1 = ((bbox[3] * fit.fitted_size[1]) + fit.offset[1]) / max(fit.target_size[1], 1)
+        return (
+            max(0.0, min(1.0, x0)),
+            max(0.0, min(1.0, y0)),
+            max(0.0, min(1.0, x1)),
+            max(0.0, min(1.0, y1)),
+        )
+
     def _save_debug_inputs(
+        self,
         *,
         debug_output_dir: Path,
         candidate_image: Image.Image,
         reference_image: Image.Image,
+        prompt_override: Optional[str] = None,
+        prompt_config: Optional[dict[str, str]] = None,
     ) -> None:
         debug_output_dir.mkdir(parents=True, exist_ok=True)
-        candidate_image.save(debug_output_dir / "01-candidate-slide.png")
-        reference_image.save(debug_output_dir / "02-reference-page.png")
+        candidate_png_bytes = OpenAIQCEvaluator._image_to_png_bytes(candidate_image)
+        reference_png_bytes = OpenAIQCEvaluator._image_to_png_bytes(reference_image)
+        (debug_output_dir / "01-candidate-slide.png").write_bytes(candidate_png_bytes)
+        (debug_output_dir / "02-reference-page.png").write_bytes(reference_png_bytes)
+        metadata = {
+            "candidate": {
+                "width": candidate_image.width,
+                "height": candidate_image.height,
+                "png_bytes": len(candidate_png_bytes),
+                "sha256": hashlib.sha256(candidate_png_bytes).hexdigest(),
+            },
+            "reference": {
+                "width": reference_image.width,
+                "height": reference_image.height,
+                "png_bytes": len(reference_png_bytes),
+                "sha256": hashlib.sha256(reference_png_bytes).hexdigest(),
+            },
+            "normalization": {
+                "max_image_dimension": self.max_image_dimension,
+                "candidate_canvas_size": [candidate_image.width, candidate_image.height],
+                "reference_canvas_size": [reference_image.width, reference_image.height],
+                "note": (
+                    "These PNG files are the exact bytes uploaded to OpenAI by this app. "
+                    "Any further internal model-side processing is not visible from the client."
+                ),
+            },
+            "prompt_override": (prompt_override or "").strip(),
+            "prompt_config": self._resolve_prompt_config(prompt_config),
+        }
+        (debug_output_dir / "00-upload-metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
     @staticmethod
-    def _final_comment(
-        raw_summary: Optional[str],
-        raw_bullets: list[str],
-        raw_note: Optional[str],
+    def _format_prompt_override(prompt_override: Optional[str]) -> str:
+        normalized = (prompt_override or "").strip()
+        if not normalized:
+            return ""
+        return f"\n\nAdditional run-specific user QC instructions:\n{normalized}"
+
+    @staticmethod
+    def _prompt_override_content(prompt_override: Optional[str]) -> list[dict]:
+        normalized = (prompt_override or "").strip()
+        if not normalized:
+            return []
+        return [
+            {
+                "type": "input_text",
+                "text": (
+                    "Additional run-specific QC instructions from the user. Follow these if they do not conflict "
+                    f"with the base comparison rules:\n{normalized}"
+                ),
+            }
+        ]
+
+    def _merge_comments(
+        self,
+        general_result: _SlideQcSchema,
+        text_result: _SlideQcSchema,
+        general_kept_findings: list[SlideQcFinding],
+        text_kept_findings: list[SlideQcFinding],
         findings: list[SlideQcFinding],
     ) -> tuple[Optional[str], list[str], Optional[str]]:
-        summary = raw_summary.strip() if raw_summary and raw_summary.strip() else None
+        general_summary = self._summary_for_output(general_result, has_kept_findings=bool(general_kept_findings))
+        text_summary = self._summary_for_output(text_result, has_kept_findings=bool(text_kept_findings))
+        if general_summary and text_summary and general_summary != text_summary:
+            summary = "AI review findings"
+        else:
+            summary = general_summary or text_summary
 
-        bullets = [bullet.strip() for bullet in raw_bullets if bullet and bullet.strip()]
+        active_general_types = {finding.finding_type for finding in general_kept_findings}
+        bullets = self._deduplicate_bullets(
+            self._filter_general_bullets(
+                self._bullets_for_output(general_result, has_kept_findings=bool(general_kept_findings)),
+                active_general_types=active_general_types,
+            )
+            + self._bullets_for_output(text_result, has_kept_findings=bool(text_kept_findings))
+        )
         if not bullets and findings:
             bullets = [finding.message.strip() for finding in findings if finding.message.strip()]
-        if summary is None and raw_note and raw_note.strip():
-            summary = raw_note.strip()
         if summary is None and bullets:
             summary = "AI review findings"
         note_parts: list[str] = []
@@ -263,6 +857,127 @@ class OpenAIQCEvaluator:
         note_parts.extend(f"- {bullet}" for bullet in bullets)
         note = "\n".join(note_parts) if note_parts else None
         return summary, bullets, note
+
+    @staticmethod
+    def _summary_for_output(result: _SlideQcSchema, *, has_kept_findings: bool) -> Optional[str]:
+        if not has_kept_findings:
+            return None
+        if result.summary and result.summary.strip():
+            return result.summary.strip()
+        if result.note and result.note.strip():
+            return result.note.strip()
+        return None
+
+    @staticmethod
+    def _bullets_for_output(result: _SlideQcSchema, *, has_kept_findings: bool) -> list[str]:
+        if not has_kept_findings:
+            return []
+        return [bullet.strip() for bullet in result.bullets if bullet and bullet.strip()]
+
+    @staticmethod
+    def _deduplicate_bullets(bullets: list[str]) -> list[str]:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for bullet in bullets:
+            key = bullet.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(bullet)
+        return deduped
+
+    @staticmethod
+    def _filter_general_bullets(
+        bullets: list[str],
+        *,
+        active_general_types: set[QcFindingType],
+    ) -> list[str]:
+        filtered: list[str] = []
+        for bullet in bullets:
+            lower = bullet.casefold()
+            if QcFindingType.WRONG_COLOR not in active_general_types and any(
+                token in lower for token in ("color", "colour", "shade", "font color", "text color")
+            ):
+                continue
+            if any(
+                token in lower
+                for token in ("position", "alignment", "aligned", "shifted", "too far", "narrower", "wider", "chart")
+            ):
+                continue
+            filtered.append(bullet)
+        return filtered
+
+    @staticmethod
+    def _merge_statuses(
+        general_status: str,
+        text_status: str,
+        findings: list[SlideQcFinding],
+    ) -> SlideQcStatus:
+        if findings:
+            return SlideQcStatus.FINDINGS
+        if general_status == SlideQcStatus.MANUAL_REVIEW.value or text_status == SlideQcStatus.MANUAL_REVIEW.value:
+            return SlideQcStatus.MANUAL_REVIEW
+        return SlideQcStatus.OK
+
+    @staticmethod
+    def _expand_bbox(
+        bbox: tuple[float, float, float, float],
+        *,
+        margin: float = 0.03,
+        min_size: float = 0.12,
+    ) -> tuple[float, float, float, float]:
+        x0, y0, x1, y1 = bbox
+        x0 = max(0.0, x0 - margin)
+        y0 = max(0.0, y0 - margin)
+        x1 = min(1.0, x1 + margin)
+        y1 = min(1.0, y1 + margin)
+        width = x1 - x0
+        height = y1 - y0
+        if width < min_size:
+            center_x = (x0 + x1) / 2.0
+            half = min_size / 2.0
+            x0 = max(0.0, center_x - half)
+            x1 = min(1.0, center_x + half)
+        if height < min_size:
+            center_y = (y0 + y1) / 2.0
+            half = min_size / 2.0
+            y0 = max(0.0, center_y - half)
+            y1 = min(1.0, center_y + half)
+        return (x0, y0, x1, y1)
+
+    @staticmethod
+    def _crop_to_bbox(image: Image.Image, bbox: tuple[float, float, float, float]) -> Image.Image:
+        x0 = max(0, min(image.width - 1, int(round(bbox[0] * image.width))))
+        y0 = max(0, min(image.height - 1, int(round(bbox[1] * image.height))))
+        x1 = max(x0 + 1, min(image.width, int(round(bbox[2] * image.width))))
+        y1 = max(y0 + 1, min(image.height, int(round(bbox[3] * image.height))))
+        return image.crop((x0, y0, x1, y1))
+
+    @staticmethod
+    def _bbox_iou(left: tuple[float, float, float, float], right: tuple[float, float, float, float]) -> float:
+        inter_x0 = max(left[0], right[0])
+        inter_y0 = max(left[1], right[1])
+        inter_x1 = min(left[2], right[2])
+        inter_y1 = min(left[3], right[3])
+        inter_width = max(0.0, inter_x1 - inter_x0)
+        inter_height = max(0.0, inter_y1 - inter_y0)
+        inter_area = inter_width * inter_height
+        if inter_area <= 0.0:
+            return 0.0
+        left_area = max(0.0, left[2] - left[0]) * max(0.0, left[3] - left[1])
+        right_area = max(0.0, right[2] - right[0]) * max(0.0, right[3] - right[1])
+        union_area = left_area + right_area - inter_area
+        if union_area <= 0.0:
+            return 0.0
+        return inter_area / union_area
+
+    @staticmethod
+    def _bbox_center(bbox: tuple[float, float, float, float]) -> tuple[float, float]:
+        return ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0)
+
+    @staticmethod
+    def _bbox_contains_point(bbox: tuple[float, float, float, float], point: tuple[float, float]) -> bool:
+        return bbox[0] <= point[0] <= bbox[2] and bbox[1] <= point[1] <= bbox[3]
 
     @staticmethod
     def _normalize_bbox(raw_bbox: list[float]) -> tuple[float, float, float, float]:

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from pptx import Presentation
 
+from app.services.models import PagePlacementResult, PlacementBundle, PlacementStatus
 from app.services.renderer import LibreOfficeRenderer, PowerPointRenderer, Renderer, RendererError
 
 
@@ -33,14 +34,20 @@ class SuccessfulRenderer:
         image_path.write_bytes(b"png")
         return [image_path]
 
+    def build_output_with_reference_slides(self, source_pptx: Path, placement_bundle: PlacementBundle, output_path: Path) -> Path:
+        output_path.write_bytes(b"pptx")
+        return output_path
+
 
 class RecordingRenderer:
     def __init__(self, should_fail: bool = False, available: bool = True):
         self.called = False
         self.slide_image_called = False
+        self.output_build_called = False
         self.should_fail = should_fail
         self.available = available
         self.mac_slide_export_macro_name = None
+        self.mac_reference_slide_insert_macro_name = None
 
     def is_available(self) -> bool:
         return self.available
@@ -60,6 +67,13 @@ class RecordingRenderer:
         image_path = output_dir / "Slide1.PNG"
         image_path.write_bytes(b"png")
         return [image_path]
+
+    def build_output_with_reference_slides(self, source_pptx: Path, placement_bundle: PlacementBundle, output_path: Path) -> Path:
+        self.output_build_called = True
+        if self.should_fail:
+            raise RendererError("renderer failed")
+        output_path.write_bytes(b"pptx")
+        return output_path
 
 
 def test_renderer_falls_back_to_secondary(tmp_path: Path) -> None:
@@ -309,13 +323,136 @@ def test_powerpoint_renderer_builds_macos_macro_slide_export_script(tmp_path: Pa
     renderer = PowerPointRenderer(
         platform_name="darwin",
         mac_slide_export_macro_name="ExportSlidesToFolder",
+        mac_slide_export_long_edge=2800,
     )
 
     script = renderer._build_applescript_macro_slide_export(tmp_path / "deck.pptx", tmp_path / "slides")
 
+    assert 'set preferredLongEdge to 2800' in script
+    assert 'run VB macro macro name "ExportSlidesToFolder" list of parameters {outputFolder, preferredLongEdge}' in script
     assert 'run VB macro macro name "ExportSlidesToFolder" list of parameters {outputFolder}' in script
     assert 'set outputFolder to "' in script
     assert 'mkdir -p ' in script
+    assert "open inputPath" not in script
+
+def test_powerpoint_renderer_builds_macos_reference_slide_insert_script(tmp_path: Path) -> None:
+    renderer = PowerPointRenderer(
+        platform_name="darwin",
+        mac_reference_slide_insert_macro_name="InsertReferenceSlidesFromManifest",
+    )
+
+    script = renderer._build_applescript_reference_slide_insert(
+        tmp_path / "deck-with-pdf-pages.pptx",
+        tmp_path / "manifest.tsv",
+    )
+
+    assert 'run VB macro macro name "InsertReferenceSlidesFromManifest" list of parameters {manifestPath}' in script
+    assert 'set expectedPresentationName to "deck-with-pdf-pages.pptx"' in script
+    assert "save currentPresentation" in script
+
+
+def test_powerpoint_renderer_builds_windows_reference_slide_insert_script(tmp_path: Path) -> None:
+    renderer = PowerPointRenderer(platform_name="windows")
+
+    script = renderer._build_powershell_reference_slide_insert_script(
+        tmp_path / "source.pptx",
+        tmp_path / "output.pptx",
+        tmp_path / "manifest.json",
+    )
+
+    assert "Copy-Item -LiteralPath $inputPath -Destination $outputPath -Force" in script
+    assert "$slide = $presentation.Slides.Add($slideIndex, 12)" in script
+    assert "$picture = $slide.Shapes.AddPicture($action.imagePath, 0, -1, 0, 0, $slideWidth, $slideHeight)" in script
+    assert "$presentation.Save()" in script
+
+
+def test_powerpoint_renderer_writes_reference_slide_manifest(tmp_path: Path) -> None:
+    image_a = tmp_path / "a.png"
+    image_b = tmp_path / "b.png"
+    image_a.write_bytes(b"a")
+    image_b.write_bytes(b"b")
+    actions = [
+        PagePlacementResult(
+            candidate_slide_index=1,
+            reference_page_index=1,
+            status=PlacementStatus.PLACED,
+            background_image_path=image_b,
+            message="insert",
+        ),
+        PagePlacementResult(
+            candidate_slide_index=0,
+            reference_page_index=0,
+            status=PlacementStatus.PLACED,
+            background_image_path=image_a,
+            message="insert",
+        ),
+    ]
+    bundle = PlacementBundle(slide_results=actions)
+
+    manifest = PowerPointRenderer._write_reference_slide_manifest(
+        PowerPointRenderer._reference_slide_actions(bundle),
+        tmp_path / "manifest.tsv",
+        tmp_path / "assets",
+    )
+
+    lines = manifest.read_text(encoding="utf-8").splitlines()
+    assert lines[0].startswith("INSERT\t1\t")
+    assert lines[1].startswith("INSERT\t0\t")
+    assert (tmp_path / "assets" / "insert-001.png").exists()
+    assert (tmp_path / "assets" / "insert-002.png").exists()
+
+
+def test_renderer_can_build_output_with_reference_slides_on_windows() -> None:
+    renderer = Renderer(
+        platform_name="windows",
+        powerpoint=RecordingRenderer(available=True),
+        libreoffice=RecordingRenderer(available=True),
+        enable_powerpoint_fallback=False,
+    )
+
+    assert renderer.can_build_output_with_reference_slides() is True
+
+
+def test_renderer_can_build_output_with_reference_slides_on_macos_when_macro_is_configured() -> None:
+    powerpoint = RecordingRenderer(available=True)
+    powerpoint.mac_reference_slide_insert_macro_name = "InsertReferenceSlidesFromManifest"
+    renderer = Renderer(
+        platform_name="darwin",
+        powerpoint=powerpoint,
+        libreoffice=RecordingRenderer(available=True),
+        enable_powerpoint_fallback=False,
+    )
+
+    assert renderer.can_build_output_with_reference_slides() is True
+
+
+def test_renderer_build_output_with_reference_slides_delegates_to_powerpoint(tmp_path: Path) -> None:
+    powerpoint = RecordingRenderer(available=True)
+    renderer = Renderer(
+        platform_name="windows",
+        powerpoint=powerpoint,
+        libreoffice=RecordingRenderer(available=True),
+        enable_powerpoint_fallback=False,
+    )
+    image = tmp_path / "reference.png"
+    image.write_bytes(b"png")
+    bundle = PlacementBundle(
+        slide_results=[
+            PagePlacementResult(
+                candidate_slide_index=0,
+                reference_page_index=0,
+                status=PlacementStatus.PLACED,
+                background_image_path=image,
+                message="insert",
+            )
+        ]
+    )
+
+    output = renderer.build_output_with_reference_slides(tmp_path / "source.pptx", bundle, tmp_path / "output.pptx")
+
+    assert output == tmp_path / "output.pptx"
+    assert output.exists()
+    assert powerpoint.output_build_called is True
 
 
 def test_powerpoint_renderer_finalizes_macos_slide_exports_into_job_folder(tmp_path: Path) -> None:

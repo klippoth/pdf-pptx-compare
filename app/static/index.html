@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PDF to PPTX Reference Placement</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260508-prompt-debug-1" />
   </head>
   <body>
     <main class="shell">
@@ -35,6 +35,7 @@
               <span id="pptx-name" class="file-pill">PPTX: none selected</span>
             </div>
           </label>
+
           <input id="pdf-input" name="pdf" type="file" accept=".pdf,application/pdf" hidden />
           <input
             id="pptx-input"
@@ -52,7 +53,7 @@
                 <span>Enable AI QC annotations</span>
               </label>
               <p class="toggle-note">
-                Uncheck this to only insert the PDF reference slides, without AI comments or rectangles.
+                Uncheck this to only insert the PDF reference slides, without AI review comments.
               </p>
               <p id="runtime-helper" class="helper">
                 Works on macOS and Windows. AI comparison prefers PowerPoint-rendered PDF pages when
@@ -62,8 +63,73 @@
               <p id="submit-state-note" class="submit-state-note hidden"></p>
             </div>
           </div>
+
+          <div class="panel-footer">
+            <span class="build-badge">UI build 20260508-prompt-debug-1</span>
+            <button
+              id="prompt-open-button"
+              class="utility-button utility-button-plain"
+              type="button"
+              onclick="if (window.__openPromptEditor) { window.__openPromptEditor('inline'); } else { console.log('[prompt-editor] inline click fired but __openPromptEditor is missing'); }"
+            >
+              Edit Prompt
+            </button>
+          </div>
         </form>
       </section>
+
+      <div id="prompt-modal" class="prompt-modal hidden" aria-hidden="true">
+        <div id="prompt-modal-backdrop" class="prompt-modal-backdrop"></div>
+        <section
+          id="prompt-modal-card"
+          class="prompt-modal-card"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="prompt-modal-title"
+        >
+          <div class="prompt-workspace">
+            <div class="prompt-workspace-header">
+              <div>
+                <p class="prompt-kicker">Prompt Workspace</p>
+                <h3 id="prompt-modal-title">AI QC prompts</h3>
+                <p class="prompt-note">
+                  These are the full prompts currently used by the visual and text review passes. Edit them here and save locally for this browser.
+                </p>
+              </div>
+              <div class="prompt-workspace-actions">
+                <button id="prompt-save-button" class="utility-button" type="button">Save Prompt</button>
+                <button id="prompt-reset-button" class="utility-button utility-button-plain" type="button">
+                  Reset to Default
+                </button>
+                <button id="prompt-close-button" class="utility-button utility-button-plain" type="button">
+                  Close
+                </button>
+              </div>
+            </div>
+            <p id="prompt-save-status" class="prompt-status">Using the default AI QC prompts.</p>
+
+            <div class="prompt-group">
+              <label class="prompt-label" for="qc-general-system-prompt">Visual pass: system prompt</label>
+              <textarea id="qc-general-system-prompt" class="prompt-textarea prompt-textarea-large" rows="10"></textarea>
+            </div>
+
+            <div class="prompt-group">
+              <label class="prompt-label" for="qc-general-user-prompt">Visual pass: user prompt</label>
+              <textarea id="qc-general-user-prompt" class="prompt-textarea" rows="6"></textarea>
+            </div>
+
+            <div class="prompt-group">
+              <label class="prompt-label" for="qc-text-system-prompt">Text pass: system prompt</label>
+              <textarea id="qc-text-system-prompt" class="prompt-textarea prompt-textarea-large" rows="10"></textarea>
+            </div>
+
+            <div class="prompt-group">
+              <label class="prompt-label" for="qc-text-user-prompt">Text pass: user prompt</label>
+              <textarea id="qc-text-user-prompt" class="prompt-textarea" rows="8"></textarea>
+            </div>
+          </div>
+        </section>
+      </div>
 
       <section id="status-panel" class="status-panel hidden" aria-live="polite">
         <div class="status-header">
@@ -101,6 +167,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js" defer></script>
+    <script src="/static/app.js?v=20260508-prompt-debug-1" defer></script>
   </body>
 </html>

@@ -74,6 +74,7 @@ Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
 - Runs rendered-slide QC against the exported PPTX PDF and the reference PDF
 - Uses parallelized GPT slide-by-slide image comparison when `OPENAI_API_KEY` is configured
 - Sends the rendered PDF page and the rendered PPT slide as the two image inputs for each comparison
+- Lets you append optional run-specific AI QC instructions from the web app without replacing the built-in review prompt
 - On Windows, PowerPoint can export the candidate slide images directly through native PowerPoint automation; no AppleScript or VBA add-in is required there
 - On macOS, direct candidate slide-image export uses the `ExportSlidesToFolder` PowerPoint VBA macro when you want native PowerPoint slide PNGs
 - Falls back to native/OCR/visual QC only when GPT QC is not configured
@@ -117,10 +118,20 @@ Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
 - `PDF_PPTX_GOOGLE_DOC_AI_LOCATION` sets the Google Document AI processor location
 - `PDF_PPTX_GOOGLE_DOC_AI_PROCESSOR_ID` sets the Google Document AI processor ID
 - `PDF_PPTX_GOOGLE_DOC_AI_PROCESSOR_VERSION` optionally pins a processor version
+- `PDF_PPTX_OPENAI_API_KEY` overrides the OpenAI key for this project only
 - `OPENAI_API_KEY` enables GPT-based slide QC
 - `PDF_PPTX_OPENAI_QC_MODEL` overrides the GPT model used for slide QC
 - `PDF_PPTX_OPENAI_QC_PARALLELISM` controls how many slide comparisons run in parallel
 - `PDF_PPTX_OPENAI_QC_TIMEOUT_SECONDS` sets the per-slide GPT request timeout
+- `PDF_PPTX_OPENAI_QC_MAX_IMAGE_DIMENSION` caps the long edge of images sent to OpenAI; set `0` to send the original render quality
+- each slide QC debug folder also includes `00-upload-metadata.json`, which records the exact uploaded PNG dimensions, byte sizes, and hashes for the candidate and reference images
+
+Project-local key option:
+
+- You can create [`.env.local.example`](/Users/kimlippoth/Desktop/Ethos/PDF%20to%20PPTX/Comp/.env.local.example) as `.env.local` in the project root.
+- Put `PDF_PPTX_OPENAI_API_KEY=...` there to override any global `OPENAI_API_KEY` only for this app.
+- `.env.local` is gitignored.
+- In packaged builds, the app also looks for `.env` and `.env.local` beside the executable. On macOS it additionally checks the folder containing the `.app` bundle, so a shared build can carry its own project-local key without touching a colleague's global shell environment.
 
 ## Packaging For Windows Users
 
@@ -132,6 +143,8 @@ If you want to send this to a non-technical Windows user, the easiest path is to
 
 That produces `dist-windows\PDFtoPPTXReference\`. Zip that whole folder and send it. The recipient can extract it and double-click `PDFtoPPTXReference.exe`.
 
+If `.env.local` exists in the project root when you build, the script copies it into the packaged folder automatically. That is the easiest way to distribute a project-specific OpenAI key with the bundle.
+
 Note:
 
 - The Windows build script intentionally uses `.venv-windows` so it does not conflict with a macOS `.venv` when the project is opened through a Parallels shared folder.
@@ -142,6 +155,7 @@ Important:
 - LibreOffice is used first when available
 - On Windows, PowerPoint fallback is enabled by default in packaged or normal runs, so a user with Microsoft PowerPoint installed can still export even without LibreOffice
 - On macOS, the app will also use Microsoft PowerPoint automatically if LibreOffice is missing and PowerPoint is installed
+- Anyone who receives a build with `.env.local` inside it can extract and reuse that API key, so only do this for trusted internal colleagues.
 
 ## Packaging For Mac Users
 
@@ -152,6 +166,8 @@ If you want a Mac app bundle:
 ```
 
 That produces `dist/PDFtoPPTXReference.app` and you can zip it for sharing.
+
+If `.env.local` exists in the project root when you build, the script copies it into `PDFtoPPTXReference.app/Contents/MacOS/.env.local` automatically.
 
 If you want a more normal Mac handoff as a disk image:
 
@@ -171,3 +187,4 @@ Important:
 - LibreOffice is used first when available
 - If LibreOffice is missing but Microsoft PowerPoint is installed, the app will use PowerPoint automatically on macOS
 - Because the app is not notarized, macOS may show a Gatekeeper warning the first time it is opened
+- Anyone who receives a build with `.env.local` inside it can extract and reuse that API key, so only do this for trusted internal colleagues.

@@ -1,5 +1,7 @@
 .venv/
 .venv-windows/
+.env
+.env.local
 __pycache__/
 .pytest_cache/
 runs/

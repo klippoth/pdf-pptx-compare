@@ -88,6 +88,17 @@ Invoke-NativeCommand $pyInstallerExe `
   --add-data "${staticSource};app/static" `
   $entryScript
 
+$bundleRoot = Join-Path $distPath "PDFtoPPTXReference"
+$localEnv = Join-Path $root ".env.local"
+$localEnvExample = Join-Path $root ".env.local.example"
+if (Test-Path $localEnv) {
+  Copy-Item $localEnv (Join-Path $bundleRoot ".env.local") -Force
+  Write-Host "Bundled project-local .env.local into the app package."
+}
+if (Test-Path $localEnvExample) {
+  Copy-Item $localEnvExample (Join-Path $bundleRoot ".env.local.example") -Force
+}
+
 Write-Host ""
 Write-Host "Build complete."
 Write-Host "Send the folder at dist-windows\PDFtoPPTXReference to the Windows user."

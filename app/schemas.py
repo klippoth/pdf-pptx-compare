@@ -22,6 +22,15 @@ class CompareResponse(BaseModel):
     ai_qc_enabled: bool = Field(default=True, alias="aiQcEnabled")
 
 
+class QcPromptConfigResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    general_system_prompt: str = Field(alias="generalSystemPrompt")
+    general_user_prompt: str = Field(alias="generalUserPrompt")
+    text_system_prompt: str = Field(alias="textSystemPrompt")
+    text_user_prompt: str = Field(alias="textUserPrompt")
+
+
 class RendererStatusResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 

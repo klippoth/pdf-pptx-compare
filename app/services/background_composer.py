@@ -82,12 +82,17 @@ class BackgroundComposer:
 
         if candidate_image is not None:
             height, width = candidate_image.shape[:2]
-            target_size = (width, height)
+            target_size = self._preferred_output_size(reference_image, candidate_image)
         else:
             width, height = target_size
 
         best: Optional[_PlacementCandidate] = None
-        candidate_bbox = self._content_bbox(candidate_image) if candidate_image is not None else None
+        candidate_bbox = None
+        if candidate_image is not None:
+            candidate_bbox = self._content_bbox(candidate_image)
+            scale_x = target_size[0] / max(candidate_image.shape[1], 1)
+            scale_y = target_size[1] / max(candidate_image.shape[0], 1)
+            candidate_bbox = self._scale_bbox(candidate_bbox, scale_x, scale_y)
 
         for angle in self.rotations:
             rotated = self._rotate_image(reference_image, angle)
@@ -100,6 +105,21 @@ class BackgroundComposer:
         if best is None:
             raise RuntimeError("Failed to generate a PDF background image.")
         return best
+
+    @staticmethod
+    def _preferred_output_size(reference_image: np.ndarray, candidate_image: np.ndarray) -> tuple[int, int]:
+        candidate_height, candidate_width = candidate_image.shape[:2]
+        reference_height, reference_width = reference_image.shape[:2]
+
+        if candidate_width <= 0 or candidate_height <= 0:
+            return (reference_width, reference_height)
+
+        scale = min(reference_width / candidate_width, reference_height / candidate_height)
+        scale = max(1.0, scale)
+        return (
+            max(candidate_width, int(round(candidate_width * scale))),
+            max(candidate_height, int(round(candidate_height * scale))),
+        )
 
     def _fit_reference_to_canvas(
         self,
@@ -204,6 +224,16 @@ class BackgroundComposer:
     def _bbox_center(bbox: tuple[int, int, int, int]) -> tuple[float, float]:
         x, y, w, h = bbox
         return (x + (w / 2.0), y + (h / 2.0))
+
+    @staticmethod
+    def _scale_bbox(bbox: tuple[int, int, int, int], scale_x: float, scale_y: float) -> tuple[int, int, int, int]:
+        x, y, w, h = bbox
+        return (
+            int(round(x * scale_x)),
+            int(round(y * scale_y)),
+            max(1, int(round(w * scale_x))),
+            max(1, int(round(h * scale_y))),
+        )
 
     @staticmethod
     def _rotate_image(image: np.ndarray, angle: int) -> np.ndarray:

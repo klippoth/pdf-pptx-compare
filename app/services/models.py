@@ -201,6 +201,8 @@ class JobRecord:
     input_pptx_path: Path
     original_pptx_name: str
     enable_ai_qc: bool = True
+    qc_prompt_override: Optional[str] = None
+    qc_prompt_config: dict[str, str] = field(default_factory=dict)
     status: str = JobState.QUEUED.value
     step: str = "Queued for processing"
     slide_progress: int = 0

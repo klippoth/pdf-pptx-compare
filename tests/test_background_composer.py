@@ -63,3 +63,20 @@ def test_background_composer_excludes_upside_down_rotation_and_keeps_reference_i
     top_left_region = output[:40, :40]
     red_pixels = (top_left_region[:, :, 0] > 200) & (top_left_region[:, :, 1] < 90) & (top_left_region[:, :, 2] < 90)
     assert red_pixels.sum() > 0
+
+
+def test_background_composer_prefers_higher_resolution_reference_canvas_when_reference_is_larger(tmp_path: Path) -> None:
+    composer = BackgroundComposer()
+    candidate = _make_slide_art((960, 540))
+    reference = _make_slide_art((2400, 1350))
+
+    result = composer.prepare_background(
+        reference_page=_page(tmp_path / "reference-large.png", reference, 0),
+        candidate_page=_page(tmp_path / "candidate-small.png", candidate, 0),
+        output_path=tmp_path / "background-large.png",
+    )
+
+    with Image.open(result.background_image_path) as image:
+        assert image.size[0] >= candidate.shape[1]
+        assert image.size[1] >= candidate.shape[0]
+        assert image.size[0] > candidate.shape[1] or image.size[1] > candidate.shape[0]

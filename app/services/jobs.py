@@ -30,6 +30,7 @@ from app.services.models import (
 from app.services.ocr_provider import GoogleDocumentAiOcrProvider
 from app.services.openai_qc import OpenAIQCEvaluator
 from app.services.pdf_font_inspector import PDFFontInspector
+from app.services.pptx_text_extractor import PptxTextExtractor
 from app.services.qc_detector import QcDetector
 from app.services.qc_report_writer import QcReportWriter
 from app.services.rasterizer import Rasterizer
@@ -49,6 +50,7 @@ class JobManager:
         self.rasterizer = Rasterizer(dpi=settings.render_dpi, poppler_bin_dir=settings.poppler_bin_dir)
         self.background_composer = BackgroundComposer()
         self.pdf_font_inspector = PDFFontInspector()
+        self.pptx_text_extractor = PptxTextExtractor()
         self.text_layout_extractor = TextLayoutExtractor(
             ocr_provider=GoogleDocumentAiOcrProvider(
                 project_id=settings.google_document_ai_project_id,
@@ -61,11 +63,7 @@ class JobManager:
         self.qc_detector = QcDetector()
         self.qc_report_writer = QcReportWriter()
         self.deck_writer = DeckWriter()
-        self.openai_qc_evaluator = OpenAIQCEvaluator(
-            api_key=settings.openai_api_key,
-            model=settings.openai_qc_model,
-            timeout_seconds=settings.openai_qc_timeout_seconds,
-        )
+        self.openai_qc_evaluator = self._build_openai_qc_evaluator()
 
         self._jobs: dict[str, JobRecord] = {}
         self._queue: Queue[Optional[str]] = Queue()
@@ -86,7 +84,14 @@ class JobManager:
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=2)
 
-    def create_job(self, pdf_upload: UploadFile, pptx_upload: UploadFile, enable_ai_qc: bool = True) -> JobRecord:
+    def create_job(
+        self,
+        pdf_upload: UploadFile,
+        pptx_upload: UploadFile,
+        enable_ai_qc: bool = True,
+        qc_prompt_override: Optional[str] = None,
+        qc_prompt_config: Optional[dict[str, str]] = None,
+    ) -> JobRecord:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
         job_id = f"{timestamp}-{secrets.token_hex(4)}"
         working_dir = self.settings.runs_dir / job_id
@@ -109,6 +114,8 @@ class JobManager:
             input_pptx_path=pptx_path,
             original_pptx_name=Path(pptx_upload.filename or "output.pptx").name,
             enable_ai_qc=enable_ai_qc,
+            qc_prompt_override=(qc_prompt_override or "").strip() or None,
+            qc_prompt_config=dict(qc_prompt_config or {}),
         )
         with self._lock:
             self._jobs[job_id] = record
@@ -266,8 +273,20 @@ class JobManager:
 
             qc_report: QcReport | None = None
             if use_model_qc:
+                self._update_job(job_id, step="Extracting PDF and PowerPoint text for AI QC")
+                reference_layouts = self.text_layout_extractor.extract_document(job.input_pdf_path, reference_pages)
+                candidate_layouts = self.pptx_text_extractor.extract_document(job.input_pptx_path)
                 self._update_job(job_id, step="Running GPT slide QC", slide_progress=0)
-                slide_qc_results_by_index.update(self._run_openai_qc(job_id, matched_pairs))
+                slide_qc_results_by_index.update(
+                    self._run_openai_qc(
+                        job_id,
+                        matched_pairs,
+                        reference_layouts=reference_layouts,
+                        candidate_layouts=candidate_layouts,
+                        prompt_override=job.qc_prompt_override,
+                        prompt_config=job.qc_prompt_config,
+                    )
+                )
             elif ai_qc_enabled:
                 self._update_job(job_id, step="Extracting page text and layout")
                 reference_layouts = self.text_layout_extractor.extract_document(job.input_pdf_path, reference_pages)
@@ -310,7 +329,14 @@ class JobManager:
             )
             output_name = f"{Path(job.original_pptx_name).stem}_with_pdf_pages.pptx"
             output_path = output_dir / output_name
-            self.deck_writer.build_output(job.input_pptx_path, bundle, output_path, qc_report=qc_report)
+            if (not ai_qc_enabled) and self.renderer.can_build_output_with_reference_slides():
+                self._update_job(
+                    job_id,
+                    step="Building output deck in PowerPoint to preserve original slides",
+                )
+                self.renderer.build_output_with_reference_slides(job.input_pptx_path, bundle, output_path)
+            else:
+                self.deck_writer.build_output(job.input_pptx_path, bundle, output_path, qc_report=qc_report)
 
             self._update_job(
                 job_id,
@@ -331,6 +357,11 @@ class JobManager:
         self,
         job_id: str,
         matched_pairs: list[tuple[int, PageImage, PageImage]],
+        *,
+        reference_layouts,
+        candidate_layouts,
+        prompt_override: Optional[str] = None,
+        prompt_config: Optional[dict[str, str]] = None,
     ) -> dict[int, SlideQcResult]:
         results: dict[int, SlideQcResult] = {}
         processed = 0
@@ -339,12 +370,15 @@ class JobManager:
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="openai-slide-qc") as executor:
             future_map = {
                 executor.submit(
-                    self.openai_qc_evaluator.compare_pages,
-                    slide_index=index,
-                    page_index=index,
+                    self._compare_slide_with_fresh_openai_evaluator,
+                    index=index,
                     reference_page=reference_page,
                     candidate_page=candidate_page,
+                    reference_layout=reference_layouts[index] if index < len(reference_layouts) else None,
+                    candidate_layout=candidate_layouts[index] if index < len(candidate_layouts) else None,
                     debug_output_dir=job_qc_inputs_dir / f"slide-{index + 1:03d}",
+                    prompt_override=prompt_override,
+                    prompt_config=prompt_config,
                 ): index
                 for index, reference_page, candidate_page in matched_pairs
             }
@@ -364,6 +398,39 @@ class JobManager:
                 processed += 1
                 self._update_job(job_id, slide_progress=processed)
         return results
+
+    def _build_openai_qc_evaluator(self) -> OpenAIQCEvaluator:
+        return OpenAIQCEvaluator(
+            api_key=self.settings.openai_api_key,
+            model=self.settings.openai_qc_model,
+            timeout_seconds=self.settings.openai_qc_timeout_seconds,
+            max_image_dimension=self.settings.openai_qc_max_image_dimension,
+        )
+
+    def _compare_slide_with_fresh_openai_evaluator(
+        self,
+        *,
+        index: int,
+        reference_page: PageImage,
+        candidate_page: PageImage,
+        reference_layout=None,
+        candidate_layout=None,
+        debug_output_dir: Path,
+        prompt_override: Optional[str] = None,
+        prompt_config: Optional[dict[str, str]] = None,
+    ) -> SlideQcResult:
+        evaluator = self._build_openai_qc_evaluator()
+        return evaluator.compare_pages(
+            slide_index=index,
+            page_index=index,
+            reference_page=reference_page,
+            candidate_page=candidate_page,
+            reference_layout=reference_layout,
+            candidate_layout=candidate_layout,
+            debug_output_dir=debug_output_dir,
+            prompt_override=prompt_override,
+            prompt_config=prompt_config,
+        )
 
     def _run_rule_based_qc(
         self,

@@ -25,6 +25,20 @@ const runtimeNote = document.getElementById("runtime-note");
 const submitStateNote = document.getElementById("submit-state-note");
 const dropzone = document.querySelector(".dropzone");
 const aiQcToggle = document.getElementById("ai-qc-toggle");
+const promptOpenButton = document.getElementById("prompt-open-button");
+const promptModal = document.getElementById("prompt-modal");
+const promptModalBackdrop = document.getElementById("prompt-modal-backdrop");
+const promptCloseButton = document.getElementById("prompt-close-button");
+const qcGeneralSystemPrompt = document.getElementById("qc-general-system-prompt");
+const qcGeneralUserPrompt = document.getElementById("qc-general-user-prompt");
+const qcTextSystemPrompt = document.getElementById("qc-text-system-prompt");
+const qcTextUserPrompt = document.getElementById("qc-text-user-prompt");
+const promptResetButton = document.getElementById("prompt-reset-button");
+const promptSaveButton = document.getElementById("prompt-save-button");
+const promptSaveStatus = document.getElementById("prompt-save-status");
+
+const debugLog = (...args) => console.log("[prompt-editor]", ...args);
+const debugError = (...args) => console.error("[prompt-editor]", ...args);
 
 let pollTimer = null;
 let isJobActive = false;
@@ -33,6 +47,7 @@ let lastCompletedSubmission = null;
 let rendererCanConvert = true;
 let rendererMessage = "";
 const lastCompletedStorageKey = "pdf-to-pptx-last-completed-pair";
+const promptConfigStorageKey = "pdf-to-pptx-qc-prompt-config-v1";
 const apiOrigin =
   window.location.protocol === "http:" || window.location.protocol === "https:"
     ? window.location.origin
@@ -79,15 +94,24 @@ const buildFileFingerprint = (file) => {
   return [file.name || "", file.size || 0, file.lastModified || 0].join("::");
 };
 
-const buildSelectedPairFingerprint = (pdfFile, pptxFile, aiQcEnabled = aiQcToggle?.checked ?? true) => {
+let defaultPromptConfig = null;
+
+const buildSelectedPairFingerprint = (
+  pdfFile,
+  pptxFile,
+  aiQcEnabled = aiQcToggle?.checked ?? true,
+  promptConfig = getCurrentPromptConfig(),
+) => {
   if (!pdfFile || !pptxFile) {
     return null;
   }
+  const normalizedPromptConfig = aiQcEnabled ? JSON.stringify(promptConfig) : "";
   return {
-    fingerprint: `${buildFileFingerprint(pdfFile)}__${buildFileFingerprint(pptxFile)}__ai:${aiQcEnabled ? "on" : "off"}`,
+    fingerprint: `${buildFileFingerprint(pdfFile)}__${buildFileFingerprint(pptxFile)}__ai:${aiQcEnabled ? "on" : "off"}__prompt:${normalizedPromptConfig}`,
     pdfName: pdfFile.name || "reference.pdf",
     pptxName: pptxFile.name || "candidate.pptx",
     aiQcEnabled,
+    promptConfig: aiQcEnabled ? promptConfig : {},
     completedAt: new Date().toISOString(),
   };
 };
@@ -108,6 +132,154 @@ const formatCompletedAt = (isoValue) => {
 
 const getCurrentSelectionFingerprint = () => {
   return buildSelectedPairFingerprint(pdfInput.files?.[0], pptxInput.files?.[0], aiQcToggle?.checked ?? true);
+};
+
+const getDefaultPromptConfig = () =>
+  defaultPromptConfig || {
+    generalSystemPrompt: "",
+    generalUserPrompt: "",
+    textSystemPrompt: "",
+    textUserPrompt: "",
+  };
+
+const getCurrentPromptConfig = () => ({
+  generalSystemPrompt: qcGeneralSystemPrompt?.value || "",
+  generalUserPrompt: qcGeneralUserPrompt?.value || "",
+  textSystemPrompt: qcTextSystemPrompt?.value || "",
+  textUserPrompt: qcTextUserPrompt?.value || "",
+});
+
+const applyPromptConfig = (config) => {
+  if (qcGeneralSystemPrompt) {
+    qcGeneralSystemPrompt.value = config.generalSystemPrompt || "";
+  }
+  if (qcGeneralUserPrompt) {
+    qcGeneralUserPrompt.value = config.generalUserPrompt || "";
+  }
+  if (qcTextSystemPrompt) {
+    qcTextSystemPrompt.value = config.textSystemPrompt || "";
+  }
+  if (qcTextUserPrompt) {
+    qcTextUserPrompt.value = config.textUserPrompt || "";
+  }
+};
+
+const promptsMatch = (left, right) =>
+  (left?.generalSystemPrompt || "") === (right?.generalSystemPrompt || "") &&
+  (left?.generalUserPrompt || "") === (right?.generalUserPrompt || "") &&
+  (left?.textSystemPrompt || "") === (right?.textSystemPrompt || "") &&
+  (left?.textUserPrompt || "") === (right?.textUserPrompt || "");
+
+const readSavedPromptConfig = () => {
+  try {
+    const rawValue = window.localStorage.getItem(promptConfigStorageKey);
+    if (!rawValue) {
+      return null;
+    }
+    const parsed = JSON.parse(rawValue);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+const writeSavedPromptConfig = (config) => {
+  try {
+    window.localStorage.setItem(promptConfigStorageKey, JSON.stringify(config));
+  } catch {
+    // Ignore storage failures and keep the in-memory editor state.
+  }
+};
+
+const clearSavedPromptConfig = () => {
+  try {
+    window.localStorage.removeItem(promptConfigStorageKey);
+  } catch {
+    // Ignore storage failures.
+  }
+};
+
+const updatePromptEditorState = () => {
+  if (!promptSaveStatus) {
+    return;
+  }
+  const isDefault = promptsMatch(getCurrentPromptConfig(), getDefaultPromptConfig());
+  promptSaveStatus.textContent = isDefault
+    ? "The editor currently matches the default prompts."
+    : "The editor currently contains custom prompts.";
+};
+
+const updatePromptStatus = () => {
+  const isDefault = promptsMatch(getCurrentPromptConfig(), getDefaultPromptConfig());
+  if (!promptSaveStatus) {
+    return;
+  }
+  if (!(aiQcToggle?.checked ?? true)) {
+    promptSaveStatus.textContent = isDefault
+      ? "AI QC is off. The editor currently matches the default prompts."
+      : "AI QC is off. The editor currently contains custom prompts.";
+    return;
+  }
+  promptSaveStatus.textContent = isDefault
+    ? "The editor currently matches the default prompts."
+    : "The editor currently contains custom prompts.";
+};
+
+const setPromptModalOpen = (isOpen) => {
+  if (!promptModal) {
+    debugError("setPromptModalOpen called but promptModal was not found.");
+    return;
+  }
+  debugLog("setPromptModalOpen", {
+    isOpen,
+    hadHiddenClass: promptModal.classList.contains("hidden"),
+    ariaHidden: promptModal.getAttribute("aria-hidden"),
+  });
+  promptModal.classList.toggle("hidden", !isOpen);
+  promptModal.style.display = isOpen ? "block" : "";
+  promptModal.setAttribute("aria-hidden", isOpen ? "false" : "true");
+  debugLog("setPromptModalOpen applied", {
+    isOpen,
+    hasHiddenClass: promptModal.classList.contains("hidden"),
+    computedDisplay: window.getComputedStyle(promptModal).display,
+    ariaHidden: promptModal.getAttribute("aria-hidden"),
+  });
+};
+
+window.__openPromptEditor = (source = "unknown") => {
+  debugLog("__openPromptEditor invoked", {
+    source,
+    buttonDisabled: promptOpenButton?.disabled ?? null,
+    modalFound: Boolean(promptModal),
+  });
+  if (promptOpenButton?.disabled) {
+    debugLog("__openPromptEditor aborted because button is disabled.");
+    return;
+  }
+  setPromptModalOpen(true);
+};
+
+const updatePromptAvailability = () => {
+  const aiEnabled = aiQcToggle?.checked ?? true;
+  debugLog("updatePromptAvailability", { aiEnabled });
+  [qcGeneralSystemPrompt, qcGeneralUserPrompt, qcTextSystemPrompt, qcTextUserPrompt].forEach((field) => {
+    if (field) {
+      field.disabled = !aiEnabled;
+    }
+  });
+  if (promptResetButton) {
+    promptResetButton.disabled = !aiEnabled;
+  }
+  if (promptSaveButton) {
+    promptSaveButton.disabled = !aiEnabled;
+  }
+  if (promptOpenButton) {
+    promptOpenButton.disabled = !aiEnabled;
+  }
+  if (!aiEnabled) {
+    setPromptModalOpen(false);
+  }
+  updatePromptStatus();
 };
 
 const applyRendererStatus = (renderer) => {
@@ -456,7 +628,79 @@ uploadInput.addEventListener("change", () => {
 
 if (aiQcToggle) {
   aiQcToggle.addEventListener("change", () => {
+    debugLog("AI QC toggle changed", { checked: aiQcToggle.checked });
+    updatePromptAvailability();
     updateSubmitAvailability();
+  });
+}
+
+[
+  qcGeneralSystemPrompt,
+  qcGeneralUserPrompt,
+  qcTextSystemPrompt,
+  qcTextUserPrompt,
+].forEach((field) => {
+  if (!field) {
+    return;
+  }
+  field.addEventListener("input", () => {
+    updatePromptStatus();
+    updatePromptEditorState();
+    updateSubmitAvailability();
+  });
+});
+
+if (promptOpenButton) {
+  promptOpenButton.addEventListener("click", () => {
+    debugLog("Edit Prompt button clicked", {
+      disabled: promptOpenButton.disabled,
+      modalFound: Boolean(promptModal),
+    });
+    window.__openPromptEditor("listener");
+  });
+} else {
+  debugError("Prompt open button was not found during script setup.");
+}
+
+if (promptModalBackdrop) {
+  promptModalBackdrop.addEventListener("click", () => {
+    debugLog("Prompt modal backdrop clicked.");
+    setPromptModalOpen(false);
+  });
+} else {
+  debugError("Prompt modal backdrop was not found during script setup.");
+}
+
+if (promptCloseButton) {
+  promptCloseButton.addEventListener("click", () => {
+    debugLog("Prompt modal close button clicked.");
+    setPromptModalOpen(false);
+  });
+} else {
+  debugError("Prompt modal close button was not found during script setup.");
+}
+
+if (promptSaveButton) {
+  promptSaveButton.addEventListener("click", () => {
+    debugLog("Prompt save clicked.");
+    writeSavedPromptConfig(getCurrentPromptConfig());
+    if (promptSaveStatus) {
+      promptSaveStatus.textContent = "Custom prompts saved locally in this browser.";
+    }
+    updateSubmitAvailability();
+  });
+}
+
+if (promptResetButton) {
+  promptResetButton.addEventListener("click", () => {
+    debugLog("Prompt reset clicked.");
+    applyPromptConfig(getDefaultPromptConfig());
+    clearSavedPromptConfig();
+    if (promptSaveStatus) {
+      promptSaveStatus.textContent = "Prompt editor reset to the default prompts.";
+    }
+    updateSubmitAvailability();
+    qcGeneralSystemPrompt?.focus();
   });
 }
 
@@ -558,6 +802,13 @@ form.addEventListener("submit", async (event) => {
   data.append("pdf", pdfInput.files[0]);
   data.append("pptx", pptxInput.files[0]);
   data.append("enable_ai_qc", aiQcToggle?.checked ? "true" : "false");
+  if (aiQcToggle?.checked) {
+    const promptConfig = getCurrentPromptConfig();
+    data.append("qc_general_system_prompt", promptConfig.generalSystemPrompt);
+    data.append("qc_general_user_prompt", promptConfig.generalUserPrompt);
+    data.append("qc_text_system_prompt", promptConfig.textSystemPrompt);
+    data.append("qc_text_user_prompt", promptConfig.textUserPrompt);
+  }
 
   try {
     await ensureBackendAvailable();
@@ -600,13 +851,59 @@ form.addEventListener("submit", async (event) => {
 });
 
 window.addEventListener("DOMContentLoaded", async () => {
+  debugLog("DOMContentLoaded", {
+    apiOrigin,
+    promptOpenButtonFound: Boolean(promptOpenButton),
+    promptModalFound: Boolean(promptModal),
+    promptModalBackdropFound: Boolean(promptModalBackdrop),
+    promptCloseButtonFound: Boolean(promptCloseButton),
+  });
   lastCompletedSubmission = readLastCompletedSubmission();
+  setPromptModalOpen(false);
   updateSubmitAvailability();
   try {
+    debugLog("Checking backend availability.");
     await ensureBackendAvailable();
+    debugLog("Backend available. Loading /api/qc-prompts.");
+    const promptResponse = await fetch(buildApiUrl("/api/qc-prompts"), { cache: "no-store" });
+    if (!promptResponse.ok) {
+      throw new Error("Could not load the AI QC prompts.");
+    }
+    defaultPromptConfig = await promptResponse.json();
+    debugLog("Loaded prompt defaults.", {
+      generalSystemLength: defaultPromptConfig?.generalSystemPrompt?.length || 0,
+      generalUserLength: defaultPromptConfig?.generalUserPrompt?.length || 0,
+      textSystemLength: defaultPromptConfig?.textSystemPrompt?.length || 0,
+      textUserLength: defaultPromptConfig?.textUserPrompt?.length || 0,
+    });
+    applyPromptConfig(readSavedPromptConfig() || defaultPromptConfig);
+    updatePromptAvailability();
+    updatePromptStatus();
+    updatePromptEditorState();
     errorCopy.classList.add("hidden");
   } catch (error) {
+    debugError("DOMContentLoaded initialization failed.", error);
     errorCopy.textContent = error.message;
     errorCopy.classList.remove("hidden");
   }
+});
+
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    debugLog("Escape pressed. Closing prompt modal.");
+    setPromptModalOpen(false);
+  }
+});
+
+window.addEventListener("error", (event) => {
+  debugError("Unhandled window error.", event.error || event.message || event);
+});
+
+window.addEventListener("unhandledrejection", (event) => {
+  debugError("Unhandled promise rejection.", event.reason || event);
+});
+
+debugLog("Script loaded.", {
+  promptOpenButtonFound: Boolean(promptOpenButton),
+  promptModalFound: Boolean(promptModal),
 });

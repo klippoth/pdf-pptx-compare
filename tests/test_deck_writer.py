@@ -4,6 +4,7 @@ from pathlib import Path
 
 from PIL import Image
 from pptx import Presentation
+from pptx.enum.text import PP_ALIGN
 
 from app.services.deck_writer import DeckWriter
 from app.services.models import (
@@ -154,14 +155,20 @@ def test_build_output_applies_qc_annotations_to_original_slides(tmp_path: Path) 
     original_slide = updated.slides[0]
     shape_names = [shape.name for shape in original_slide.shapes]
 
-    assert "QC_missing_content_1" in shape_names
+    assert shape_names.count("PDF_ORIGINAL") == 1
     assert "QC_BADGE_1" not in shape_names
-    assert "QC_SUMMARY" in shape_names
-    summary_shape = next(shape for shape in original_slide.shapes if shape.name == "QC_SUMMARY")
+    summary_shape = next(
+        shape
+        for shape in original_slide.shapes
+        if shape.name == "PDF_ORIGINAL" and shape.has_text_frame and any(p.text for p in shape.text_frame.paragraphs)
+    )
     paragraph_text = [paragraph.text for paragraph in summary_shape.text_frame.paragraphs if paragraph.text]
     assert paragraph_text == [
         "AI review findings",
         "• Missing logo in the top-right corner",
         "• Accent bar color does not match the PDF reference",
     ]
+    assert all(paragraph.alignment == PP_ALIGN.LEFT for paragraph in summary_shape.text_frame.paragraphs if paragraph.text)
+    assert summary_shape.left > updated.slide_width * 0.5
+    assert summary_shape.top > updated.slide_height * 0.5
     assert len(updated.slides) == 2
