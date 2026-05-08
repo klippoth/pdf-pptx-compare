@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections import Counter
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from io import BytesIO
@@ -69,6 +70,9 @@ DEFAULT_TEXT_SYSTEM_PROMPT = (
     "the matching reference line before returning a finding. Also verify every proposed finding a second "
     "time before returning it. Do not proofread, rewrite, improve grammar, or suggest better phrasing. "
     "Do not normalize wording. Ignore color, shapes, charts, and general layout drift in this pass. "
+    "If extracted text is missing or incomplete for a readable region, still do a careful visual text "
+    "check there. This is especially important for short chart labels, superscripts, symbols, currency "
+    "markers, percentages, and other small text that extraction may miss. "
     "Return bounding boxes in normalized candidate-image coordinates [x0, y0, x1, y1] between 0 and 1."
 )
 
@@ -85,7 +89,9 @@ DEFAULT_TEXT_USER_PROMPT = (
     "obvious typos, misspellings, dropped letters, extra letters, swapped letters, and "
     "repeated letters. If a region looks the same in both images on the second check, do "
     "not report a discrepancy there. Do not correct grammar, normalize wording, or call "
-    "out preferred wording. Do not infer what the text probably meant."
+    "out preferred wording. Do not infer what the text probably meant. If the extracted "
+    "text does not cover a readable text element, still verify that text visually from the "
+    "images before deciding whether it differs."
 )
 
 PROMPT_CONFIG_KEYS = (
@@ -233,6 +239,7 @@ class OpenAIQCEvaluator:
                 next_finding_id=len(kept_general_findings) + 1,
             ),
             text_discrepancies=text_discrepancies,
+            candidate_text_regions=candidate_text_regions,
         )
         findings: list[SlideQcFinding] = []
         findings.extend(kept_general_findings)
@@ -452,14 +459,28 @@ class OpenAIQCEvaluator:
             candidate_crop = self._crop_to_bbox(candidate_image, self._expand_bbox(discrepancy.candidate_bbox, margin=0.02, min_size=0.08))
             reference_canvas_bbox = self._map_bbox_to_canvas(discrepancy.reference_bbox, reference_fit)
             reference_crop = self._crop_to_bbox(reference_image, self._expand_bbox(reference_canvas_bbox, margin=0.02, min_size=0.08))
+            if discrepancy.reference_text and discrepancy.candidate_text:
+                discrepancy_summary = (
+                    f'Reference reads "{self._trim_text(discrepancy.reference_text, max_length=100)}". '
+                    f'Candidate reads "{self._trim_text(discrepancy.candidate_text, max_length=100)}". '
+                )
+            elif discrepancy.candidate_text:
+                discrepancy_summary = (
+                    "Reference has no matching extracted text item in this region. "
+                    f'Candidate reads "{self._trim_text(discrepancy.candidate_text, max_length=100)}". '
+                )
+            else:
+                discrepancy_summary = (
+                    f'Reference reads "{self._trim_text(discrepancy.reference_text, max_length=100)}". '
+                    "Candidate has no matching extracted text item in this region. "
+                )
             content.extend(
                 [
                     {
                         "type": "input_text",
                         "text": (
                             f"Suspicious text diff {index} ({discrepancy.label}). "
-                            f'Reference reads "{self._trim_text(discrepancy.reference_text, max_length=100)}". '
-                            f'Candidate reads "{self._trim_text(discrepancy.candidate_text, max_length=100)}". '
+                            f"{discrepancy_summary}"
                             "The next image is the candidate text crop and the image after that is the reference text crop for the matching region."
                         ),
                     },
@@ -529,14 +550,31 @@ class OpenAIQCEvaluator:
         findings: list[SlideQcFinding],
         *,
         text_discrepancies: list[_TextDiscrepancySupport],
+        candidate_text_regions: list[tuple[float, float, float, float]],
     ) -> list[SlideQcFinding]:
-        if not text_discrepancies:
-            return []
         kept: list[SlideQcFinding] = []
         for finding in findings:
             if any(self._text_finding_matches_support(finding, support) for support in text_discrepancies):
                 kept.append(finding)
+                continue
+            if self._allow_visual_text_fallback(
+                finding,
+                candidate_text_regions=candidate_text_regions,
+            ):
+                kept.append(finding)
         return kept
+
+    def _allow_visual_text_fallback(
+        self,
+        finding: SlideQcFinding,
+        *,
+        candidate_text_regions: list[tuple[float, float, float, float]],
+    ) -> bool:
+        if finding.confidence < 0.9:
+            return False
+        if any(self._text_color_finding_matches_region(finding, bbox) for bbox in candidate_text_regions):
+            return False
+        return True
 
     def _text_finding_matches_support(
         self,
@@ -639,16 +677,23 @@ class OpenAIQCEvaluator:
         if not reference_items or not candidate_items:
             return []
 
-        matches = self._match_text_blocks(reference_items, candidate_items)
+        ordered_reference = sorted(reference_items, key=lambda item: (item.bbox[1], item.bbox[0]))
+        ordered_candidate = sorted(candidate_items, key=lambda item: (item.bbox[1], item.bbox[0]))
+        matches, matched_reference_indexes, matched_candidate_indexes = self._match_text_blocks(
+            ordered_reference,
+            ordered_candidate,
+        )
         items: list[_TextDiscrepancySupport] = []
-        for reference_item, candidate_item, text_score, position_score in matches:
+        for reference_index, candidate_index, text_score, position_score in matches:
+            reference_item = ordered_reference[reference_index]
+            candidate_item = ordered_candidate[candidate_index]
             reference_text = self._normalize_text(reference_item.text)
             candidate_text = self._normalize_text(candidate_item.text)
             if not reference_text or not candidate_text or reference_text == candidate_text:
                 continue
             if text_score < 0.58 and position_score < 0.82:
                 continue
-            label = "likely line-level typo/spelling difference" if text_score >= 0.82 else "line-level text mismatch"
+            label = self._label_for_text_mismatch(reference_item.text, candidate_item.text, text_score=text_score)
             items.append(
                 _TextDiscrepancySupport(
                     candidate_bbox=self._normalize_bbox(list(candidate_item.bbox)),
@@ -662,6 +707,26 @@ class OpenAIQCEvaluator:
             )
             if len(items) >= max_items:
                 break
+
+        if len(items) < max_items:
+            items.extend(
+                self._collect_candidate_only_text_discrepancies(
+                    ordered_reference=ordered_reference,
+                    ordered_candidate=ordered_candidate,
+                    matched_candidate_indexes=matched_candidate_indexes,
+                    max_items=max_items - len(items),
+                )
+            )
+
+        if len(items) < max_items:
+            items.extend(
+                self._collect_reference_only_text_discrepancies(
+                    ordered_reference=ordered_reference,
+                    ordered_candidate=ordered_candidate,
+                    matched_reference_indexes=matched_reference_indexes,
+                    max_items=max_items - len(items),
+                )
+            )
         return items
 
     def _collect_candidate_text_regions(
@@ -676,13 +741,12 @@ class OpenAIQCEvaluator:
         self,
         reference_paragraphs: list[ParagraphLayout | TextBox],
         candidate_paragraphs: list[ParagraphLayout | TextBox],
-    ) -> list[tuple[ParagraphLayout | TextBox, ParagraphLayout | TextBox, float, float]]:
-        ordered_reference = sorted(reference_paragraphs, key=lambda item: (item.bbox[1], item.bbox[0]))
-        ordered_candidate = sorted(candidate_paragraphs, key=lambda item: (item.bbox[1], item.bbox[0]))
+    ) -> tuple[list[tuple[int, int, float, float]], set[int], set[int]]:
         used_candidate_indexes: set[int] = set()
-        matches: list[tuple[ParagraphLayout | TextBox, ParagraphLayout | TextBox, float, float]] = []
+        used_reference_indexes: set[int] = set()
+        matches: list[tuple[int, int, float, float]] = []
 
-        for reference_paragraph in ordered_reference:
+        for reference_index, reference_paragraph in enumerate(reference_paragraphs):
             normalized_reference = self._normalize_text(reference_paragraph.text)
             if not normalized_reference:
                 continue
@@ -692,7 +756,7 @@ class OpenAIQCEvaluator:
             best_text_score = 0.0
             best_position_score = 0.0
 
-            for candidate_index, candidate_paragraph in enumerate(ordered_candidate):
+            for candidate_index, candidate_paragraph in enumerate(candidate_paragraphs):
                 if candidate_index in used_candidate_indexes:
                     continue
                 normalized_candidate = self._normalize_text(candidate_paragraph.text)
@@ -713,16 +777,125 @@ class OpenAIQCEvaluator:
 
             if best_index >= 0:
                 used_candidate_indexes.add(best_index)
-                matches.append(
-                    (
-                        reference_paragraph,
-                        ordered_candidate[best_index],
-                        best_text_score,
-                        best_position_score,
-                    )
-                )
+                used_reference_indexes.add(reference_index)
+                matches.append((reference_index, best_index, best_text_score, best_position_score))
 
-        return matches
+        return matches, used_reference_indexes, used_candidate_indexes
+
+    def _collect_candidate_only_text_discrepancies(
+        self,
+        *,
+        ordered_reference: list[ParagraphLayout | TextBox],
+        ordered_candidate: list[ParagraphLayout | TextBox],
+        matched_candidate_indexes: set[int],
+        max_items: int,
+    ) -> list[_TextDiscrepancySupport]:
+        if max_items <= 0:
+            return []
+        reference_counts = Counter(
+            self._normalize_text(item.text)
+            for item in ordered_reference
+            if self._normalize_text(item.text)
+        )
+        supports: list[_TextDiscrepancySupport] = []
+        for candidate_index, candidate_item in enumerate(ordered_candidate):
+            normalized_candidate = self._normalize_text(candidate_item.text)
+            if not normalized_candidate:
+                continue
+            if candidate_index in matched_candidate_indexes:
+                if reference_counts[normalized_candidate] > 0:
+                    reference_counts[normalized_candidate] -= 1
+                continue
+            if reference_counts[normalized_candidate] > 0:
+                reference_counts[normalized_candidate] -= 1
+                continue
+            similar_match = self._best_similarity_against_items(candidate_item, ordered_reference)
+            if similar_match and (similar_match[0] >= 0.55 or similar_match[1] >= 0.78):
+                continue
+            supports.append(
+                _TextDiscrepancySupport(
+                    candidate_bbox=self._normalize_bbox(list(candidate_item.bbox)),
+                    reference_bbox=self._normalize_bbox(list(candidate_item.bbox)),
+                    reference_text="",
+                    candidate_text=candidate_item.text,
+                    text_score=0.0,
+                    position_score=0.0,
+                    label="candidate-only extra text item",
+                )
+            )
+            if len(supports) >= max_items:
+                break
+        return supports
+
+    def _collect_reference_only_text_discrepancies(
+        self,
+        *,
+        ordered_reference: list[ParagraphLayout | TextBox],
+        ordered_candidate: list[ParagraphLayout | TextBox],
+        matched_reference_indexes: set[int],
+        max_items: int,
+    ) -> list[_TextDiscrepancySupport]:
+        if max_items <= 0:
+            return []
+        candidate_counts = Counter(
+            self._normalize_text(item.text)
+            for item in ordered_candidate
+            if self._normalize_text(item.text)
+        )
+        supports: list[_TextDiscrepancySupport] = []
+        for reference_index, reference_item in enumerate(ordered_reference):
+            normalized_reference = self._normalize_text(reference_item.text)
+            if not normalized_reference:
+                continue
+            if reference_index in matched_reference_indexes:
+                if candidate_counts[normalized_reference] > 0:
+                    candidate_counts[normalized_reference] -= 1
+                continue
+            if candidate_counts[normalized_reference] > 0:
+                candidate_counts[normalized_reference] -= 1
+                continue
+            similar_match = self._best_similarity_against_items(reference_item, ordered_candidate)
+            if similar_match and (similar_match[0] >= 0.55 or similar_match[1] >= 0.78):
+                continue
+            supports.append(
+                _TextDiscrepancySupport(
+                    candidate_bbox=self._normalize_bbox(list(reference_item.bbox)),
+                    reference_bbox=self._normalize_bbox(list(reference_item.bbox)),
+                    reference_text=reference_item.text,
+                    candidate_text="",
+                    text_score=0.0,
+                    position_score=0.0,
+                    label="reference-only missing text item",
+                )
+            )
+            if len(supports) >= max_items:
+                break
+        return supports
+
+    def _best_similarity_against_items(
+        self,
+        anchor_item: ParagraphLayout | TextBox,
+        other_items: list[ParagraphLayout | TextBox],
+    ) -> tuple[float, float] | None:
+        normalized_anchor = self._normalize_text(anchor_item.text)
+        if not normalized_anchor:
+            return None
+        best_text_score = 0.0
+        best_position_score = 0.0
+        found = False
+        for other_item in other_items:
+            normalized_other = self._normalize_text(other_item.text)
+            if not normalized_other:
+                continue
+            found = True
+            text_score = SequenceMatcher(None, normalized_anchor, normalized_other).ratio()
+            position_score = self._position_similarity(anchor_item.bbox, other_item.bbox)
+            if (text_score, position_score) > (best_text_score, best_position_score):
+                best_text_score = text_score
+                best_position_score = position_score
+        if not found:
+            return None
+        return best_text_score, best_position_score
 
     @staticmethod
     def _text_items(layout: Optional[TextLayout]) -> list[ParagraphLayout | TextBox]:
@@ -735,9 +908,66 @@ class OpenAIQCEvaluator:
     @staticmethod
     def _normalize_text(value: str) -> str:
         normalized = unicodedata.normalize("NFKC", value or "")
-        normalized = normalized.replace("’", "'").replace("“", '"').replace("”", '"').replace("–", "-").replace("—", "-")
+        normalized = (
+            normalized
+            .replace("\u00ad", "")
+            .replace("\u200b", "")
+            .replace("\u200c", "")
+            .replace("\u200d", "")
+            .replace("\ufeff", "")
+            .replace("’", "'")
+            .replace("“", '"')
+            .replace("”", '"')
+            .replace("–", "-")
+            .replace("—", "-")
+        )
+        normalized = re.sub(r"([A-Za-z])-\s+([A-Za-z])", r"\1-\2", normalized)
         normalized = re.sub(r"\s+", " ", normalized)
         return normalized.strip().casefold()
+
+    def _label_for_text_mismatch(self, reference_text: str, candidate_text: str, *, text_score: float) -> str:
+        if self._number_tokens(reference_text) != self._number_tokens(candidate_text):
+            return "numeric-token mismatch"
+        if self._has_non_ascii_or_confusable_difference(reference_text, candidate_text):
+            return "possible unicode/confusable-character mismatch"
+        if self._is_short_symbol_heavy_label(reference_text, candidate_text):
+            return "short label or symbol-level text mismatch"
+        return "likely line-level typo/spelling difference" if text_score >= 0.82 else "line-level text mismatch"
+
+    @staticmethod
+    def _number_tokens(text: str) -> list[str]:
+        return re.findall(r"[\$\(]?-?\d[\d,]*\.?\d*[%\)BMK]?", text or "", flags=re.IGNORECASE)
+
+    def _has_non_ascii_or_confusable_difference(self, reference_text: str, candidate_text: str) -> bool:
+        return (
+            self._contains_non_ascii(reference_text)
+            or self._contains_non_ascii(candidate_text)
+            or self._looks_like_confusable_mismatch(reference_text, candidate_text)
+        )
+
+    @staticmethod
+    def _contains_non_ascii(text: str) -> bool:
+        return any(ord(character) > 127 for character in (text or ""))
+
+    @staticmethod
+    def _looks_like_confusable_mismatch(reference_text: str, candidate_text: str) -> bool:
+        confusable_map = str.maketrans(
+            {
+                "А": "A", "В": "B", "С": "C", "Е": "E", "Н": "H", "К": "K", "М": "M", "О": "O", "Р": "P", "Т": "T", "Х": "X",
+                "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x", "і": "i", "Ι": "I", "Β": "B",
+                "Α": "A", "Ε": "E", "Ζ": "Z", "Η": "H", "Ι": "I", "Κ": "K", "Μ": "M", "Ν": "N", "Ο": "O", "Ρ": "P",
+                "Τ": "T", "Υ": "Y", "Χ": "X",
+            }
+        )
+        normalized_reference = unicodedata.normalize("NFKC", reference_text or "").translate(confusable_map)
+        normalized_candidate = unicodedata.normalize("NFKC", candidate_text or "").translate(confusable_map)
+        return normalized_reference.casefold() == normalized_candidate.casefold() and reference_text != candidate_text
+
+    @staticmethod
+    def _is_short_symbol_heavy_label(reference_text: str, candidate_text: str) -> bool:
+        combined = f"{reference_text}{candidate_text}"
+        compact = re.sub(r"\s+", "", combined)
+        return len(compact) <= 12 and any(character in compact for character in "$%()")
 
     @staticmethod
     def _position_similarity(reference_bbox, candidate_bbox) -> float:

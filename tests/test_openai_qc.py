@@ -286,10 +286,12 @@ def test_openai_qc_prompt_explicitly_checks_obvious_typos_and_misspellings() -> 
     assert "check suspicious lines one by one" in system_prompt
     assert "verify every proposed finding a second time" in system_prompt
     assert "deterministic text-diff checklist" in system_prompt
+    assert "short chart labels, superscripts, symbols, currency markers, percentages" in system_prompt
     assert "Check these areas in order" in user_prompt
     assert "Work through those suspicious text items line by line" in user_prompt
     assert "If a region looks the same in both images on the second check, do not report a discrepancy there." in user_prompt
     assert "If a deterministic text-diff checklist is provided" in user_prompt
+    assert "If the extracted text does not cover a readable text element" in user_prompt
 
 
 def test_openai_qc_evaluator_exposes_unavailability_without_key() -> None:
@@ -585,6 +587,75 @@ def test_openai_qc_drops_text_findings_when_deterministic_text_matches() -> None
     assert result.findings == []
     assert result.summary is None
     assert result.comment_bullets == []
+
+
+def test_openai_qc_keeps_high_confidence_visual_text_findings_when_region_is_not_extracted() -> None:
+    general_payload = SimpleNamespace(status="ok", summary=None, bullets=[], note="", comparison_confidence=0.9, findings=[])
+    text_payload = SimpleNamespace(
+        status="findings",
+        summary="Text discrepancy found",
+        bullets=["Extra dollar sign appears in the 3% chart label."],
+        note="",
+        comparison_confidence=0.93,
+        findings=[
+            SimpleNamespace(
+                type="wrong_text",
+                severity="medium",
+                message='Chart label includes an extra "$" character before 3%.',
+                confidence=0.94,
+                bbox=[0.30, 0.60, 0.40, 0.72],
+            ),
+        ],
+    )
+    fake_client = _FakeClient([general_payload, text_payload])
+    evaluator = OpenAIQCEvaluator(api_key="test", client=fake_client)
+
+    result = evaluator.compare_pages(
+        slide_index=0,
+        page_index=0,
+        reference_page=_page(0),
+        candidate_page=_page(0),
+        reference_layout=_layout("medSR Revenue & Contribution Margin", bbox=(0.20, 0.10, 0.85, 0.22)),
+        candidate_layout=_layout("medSR Revenue & Contribution Margin", bbox=(0.20, 0.10, 0.85, 0.22)),
+    )
+
+    assert result.status == SlideQcStatus.FINDINGS
+    assert [finding.finding_type for finding in result.findings] == [QcFindingType.WRONG_TEXT]
+    assert result.comment_bullets == ["Extra dollar sign appears in the 3% chart label."]
+
+
+def test_openai_qc_drops_low_confidence_visual_text_findings_without_extraction_support() -> None:
+    general_payload = SimpleNamespace(status="ok", summary=None, bullets=[], note="", comparison_confidence=0.9, findings=[])
+    text_payload = SimpleNamespace(
+        status="findings",
+        summary="Text discrepancy found",
+        bullets=["Extra dollar sign appears in the 3% chart label."],
+        note="",
+        comparison_confidence=0.88,
+        findings=[
+            SimpleNamespace(
+                type="wrong_text",
+                severity="medium",
+                message='Chart label includes an extra "$" character before 3%.',
+                confidence=0.84,
+                bbox=[0.30, 0.60, 0.40, 0.72],
+            ),
+        ],
+    )
+    fake_client = _FakeClient([general_payload, text_payload])
+    evaluator = OpenAIQCEvaluator(api_key="test", client=fake_client)
+
+    result = evaluator.compare_pages(
+        slide_index=0,
+        page_index=0,
+        reference_page=_page(0),
+        candidate_page=_page(0),
+        reference_layout=_layout("medSR Revenue & Contribution Margin", bbox=(0.20, 0.10, 0.85, 0.22)),
+        candidate_layout=_layout("medSR Revenue & Contribution Margin", bbox=(0.20, 0.10, 0.85, 0.22)),
+    )
+
+    assert result.status == SlideQcStatus.OK
+    assert result.findings == []
 
 
 def test_openai_qc_evaluator_normalizes_both_images_to_same_dimensions() -> None:
