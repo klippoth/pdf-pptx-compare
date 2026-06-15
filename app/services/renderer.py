@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import secrets
 from typing import TYPE_CHECKING, Optional, Protocol
+import zipfile
 
 from pptx import Presentation as PptxPresentation
 
@@ -1060,7 +1061,43 @@ class Renderer:
         exporter = self.powerpoint
         if not hasattr(exporter, "build_output_with_reference_slides"):
             raise RendererError("The configured PowerPoint renderer does not support output assembly.")
-        return exporter.build_output_with_reference_slides(source_pptx, placement_bundle, output_path)  # type: ignore[attr-defined]
+        built_output = exporter.build_output_with_reference_slides(source_pptx, placement_bundle, output_path)  # type: ignore[attr-defined]
+        self._normalize_reference_slide_names(built_output)
+        return built_output
+
+    @staticmethod
+    def _normalize_reference_slide_names(output_path: Path) -> None:
+        if not output_path.exists():
+            return
+        temp_path = output_path.with_name(f"{output_path.stem}.normalized{output_path.suffix}")
+        changed = False
+        try:
+            with zipfile.ZipFile(output_path, "r") as source_zip, zipfile.ZipFile(temp_path, "w") as target_zip:
+                for item in source_zip.infolist():
+                    data = source_zip.read(item.filename)
+                    if re.fullmatch(r"ppt/slides/slide\d+\.xml", item.filename):
+                        updated = re.sub(
+                            rb'(<(?:[\w]+:)?cSld\b[^>]*\bname=)(["\'])PDF_ORIGINAL_[^"\']+\2',
+                            lambda match: match.group(1) + match.group(2) + b"PDF_ORIGINAL" + match.group(2),
+                            data,
+                        )
+                        if updated != data:
+                            changed = True
+                            data = updated
+                    target_zip.writestr(item, data)
+        except zipfile.BadZipFile:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+            return
+        if changed:
+            temp_path.replace(output_path)
+            return
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
 
     def is_powerpoint_available(self) -> bool:
         return self.availability().powerpoint_available

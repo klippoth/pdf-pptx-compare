@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
+import os
 import secrets
 import shutil
+import subprocess
 import threading
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from queue import Queue
 from typing import Optional
+import xml.etree.ElementTree as ET
 
 from fastapi import UploadFile
 
@@ -29,7 +33,6 @@ from app.services.models import (
 )
 from app.services.ocr_provider import GoogleDocumentAiOcrProvider
 from app.services.openai_qc import OpenAIQCEvaluator
-from app.services.pdf_font_inspector import PDFFontInspector
 from app.services.pptx_text_extractor import PptxTextExtractor
 from app.services.qc_detector import QcDetector
 from app.services.qc_report_writer import QcReportWriter
@@ -40,16 +43,18 @@ from app.services.visual_comparator import VisualComparator
 
 
 logger = logging.getLogger(__name__)
+EMU_PER_INCH = 914400.0
+PRESENTATION_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
 
 
 class JobManager:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.settings.runs_dir.mkdir(parents=True, exist_ok=True)
+        self.settings.downloads_dir.mkdir(parents=True, exist_ok=True)
         self.renderer = build_renderer(settings)
         self.rasterizer = Rasterizer(dpi=settings.render_dpi, poppler_bin_dir=settings.poppler_bin_dir)
         self.background_composer = BackgroundComposer()
-        self.pdf_font_inspector = PDFFontInspector()
         self.pptx_text_extractor = PptxTextExtractor()
         self.text_layout_extractor = TextLayoutExtractor(
             ocr_provider=GoogleDocumentAiOcrProvider(
@@ -88,7 +93,7 @@ class JobManager:
         self,
         pdf_upload: UploadFile,
         pptx_upload: UploadFile,
-        enable_ai_qc: bool = True,
+        enable_ai_qc: bool = False,
         qc_prompt_override: Optional[str] = None,
         qc_prompt_config: Optional[dict[str, str]] = None,
     ) -> JobRecord:
@@ -154,22 +159,12 @@ class JobManager:
         qc_dir = job.working_dir / "qc"
 
         try:
-            self._update_job(job_id, status=JobState.PROCESSING.value, step="Inspecting PDF fonts")
-            font_inspection = self.pdf_font_inspector.inspect(job.input_pdf_path)
-            pdf_font_report_path = self.pdf_font_inspector.write_report(font_inspection, output_dir / "pdf_fonts.json")
-            self._update_job(
-                job_id,
-                pdf_fonts=font_inspection.fonts,
-                pdf_page_character_totals=font_inspection.page_character_totals,
-                pdf_page_count=font_inspection.page_count,
-                pdf_font_report_path=pdf_font_report_path,
-            )
+            self._update_job(job_id, status=JobState.PROCESSING.value, step="Rendering reference PDF")
 
             ai_qc_enabled = job.enable_ai_qc
             use_model_qc = ai_qc_enabled and self.openai_qc_evaluator.is_available()
-            use_direct_slide_images = self.renderer.can_export_slide_images() and (
-                use_model_qc or not ai_qc_enabled
-            )
+            use_reference_only_insertion = not ai_qc_enabled
+            use_direct_slide_images = self.renderer.can_export_slide_images() and use_model_qc
             comparison_export_renderer = None
             comparison_export_fallback = True
             comparison_raster_engine = "fitz"
@@ -185,11 +180,30 @@ class JobManager:
                 render_dir / "reference-pages",
                 engine=comparison_raster_engine,
             )
-            self._update_job(job_id, step=f"Rendered reference pages via {self.rasterizer.last_used_engine}")
+            self._update_job(
+                job_id,
+                step=f"Rendered reference pages via {self.rasterizer.last_used_engine}",
+                pdf_page_count=len(reference_pages),
+            )
 
             candidate_pdf: Optional[Path] = None
             candidate_pdf_pages: list[PageImage] = []
-            if use_direct_slide_images:
+            comparison_candidate_pages: list[PageImage] = []
+            reference_layouts = []
+            candidate_layouts = []
+            bundle = PlacementBundle()
+            slide_qc_results_by_index: dict[int, SlideQcResult] = {}
+            matched_pairs: list[tuple[int, PageImage, PageImage]] = []
+
+            if use_reference_only_insertion:
+                self._update_job(job_id, step="Preparing PDF reference slides without candidate rendering")
+                bundle, slide_qc_results_by_index, total_pages = self._build_reference_only_placement_bundle(
+                    job.input_pptx_path,
+                    reference_pages,
+                    placed_dir,
+                )
+                self._update_job(job_id, step="Preparing slide references", slide_count=total_pages, slide_progress=0)
+            elif use_direct_slide_images:
                 self._update_job(
                     job_id,
                     step=(
@@ -234,54 +248,48 @@ class JobManager:
                     job_id,
                     step=f"Rendered candidate slides via {self.renderer.last_used_renderer} + {self.rasterizer.last_used_engine}",
                 )
+
+            if not use_reference_only_insertion:
                 if use_model_qc:
                     self._update_job(job_id, step="Preparing candidate slide images for AI comparison")
+                total_pages = max(len(reference_pages), len(comparison_candidate_pages))
+                self._update_job(job_id, step="Preparing slide references", slide_count=total_pages, slide_progress=0)
 
-            reference_layouts = []
-            candidate_layouts = []
-            total_pages = max(len(reference_pages), len(comparison_candidate_pages))
-            self._update_job(job_id, step="Preparing slide references", slide_count=total_pages, slide_progress=0)
-
-            bundle = PlacementBundle()
-            slide_qc_results_by_index: dict[int, SlideQcResult] = {}
-            matched_pairs: list[tuple[int, PageImage, PageImage]] = []
-            fallback_target_size = (
-                (comparison_candidate_pages[0].width, comparison_candidate_pages[0].height)
-                if comparison_candidate_pages
-                else (reference_pages[0].width, reference_pages[0].height)
-            )
-            for index in range(total_pages):
-                if index < len(reference_pages) and index < len(comparison_candidate_pages):
-                    result = self.background_composer.prepare_background(
-                        reference_page=reference_pages[index],
-                        candidate_page=comparison_candidate_pages[index],
-                        output_path=placed_dir / f"background-{index + 1:03d}.png",
-                    )
-                    bundle.slide_results.append(result)
-                    matched_pairs.append((index, reference_pages[index], comparison_candidate_pages[index]))
-                elif index < len(comparison_candidate_pages):
-                    bundle.slide_results.append(self.background_composer.no_matching_pdf_page(candidate_slide_index=index))
-                    slide_qc_results_by_index[index] = self._missing_reference_qc_result(index)
-                else:
-                    bundle.extra_reference_results.append(
-                        self.background_composer.prepare_extra_reference_page(
+                fallback_target_size = (
+                    (comparison_candidate_pages[0].width, comparison_candidate_pages[0].height)
+                    if comparison_candidate_pages
+                    else (reference_pages[0].width, reference_pages[0].height)
+                )
+                for index in range(total_pages):
+                    if index < len(reference_pages) and index < len(comparison_candidate_pages):
+                        result = self.background_composer.prepare_background(
                             reference_page=reference_pages[index],
-                            target_size=fallback_target_size,
-                            output_path=placed_dir / f"extra-{index + 1:03d}.png",
+                            candidate_page=comparison_candidate_pages[index],
+                            output_path=placed_dir / f"background-{index + 1:03d}.png",
                         )
-                    )
+                        bundle.slide_results.append(result)
+                        matched_pairs.append((index, reference_pages[index], comparison_candidate_pages[index]))
+                    elif index < len(comparison_candidate_pages):
+                        bundle.slide_results.append(self.background_composer.no_matching_pdf_page(candidate_slide_index=index))
+                        slide_qc_results_by_index[index] = self._missing_reference_qc_result(index)
+                    else:
+                        bundle.extra_reference_results.append(
+                            self.background_composer.prepare_extra_reference_page(
+                                reference_page=reference_pages[index],
+                                target_size=fallback_target_size,
+                                output_path=placed_dir / f"extra-{index + 1:03d}.png",
+                            )
+                        )
 
             qc_report: QcReport | None = None
             if use_model_qc:
-                self._update_job(job_id, step="Extracting PDF and PowerPoint text for AI QC")
-                reference_layouts = self.text_layout_extractor.extract_document(job.input_pdf_path, reference_pages)
+                self._update_job(job_id, step="Extracting PowerPoint text for AI QC")
                 candidate_layouts = self.pptx_text_extractor.extract_document(job.input_pptx_path)
                 self._update_job(job_id, step="Running GPT slide QC", slide_progress=0)
                 slide_qc_results_by_index.update(
                     self._run_openai_qc(
                         job_id,
                         matched_pairs,
-                        reference_layouts=reference_layouts,
                         candidate_layouts=candidate_layouts,
                         prompt_override=job.qc_prompt_override,
                         prompt_config=job.qc_prompt_config,
@@ -329,20 +337,35 @@ class JobManager:
             )
             output_name = f"{Path(job.original_pptx_name).stem}_with_pdf_pages.pptx"
             output_path = output_dir / output_name
-            if (not ai_qc_enabled) and self.renderer.can_build_output_with_reference_slides():
-                self._update_job(
-                    job_id,
-                    step="Building output deck in PowerPoint to preserve original slides",
-                )
-                self.renderer.build_output_with_reference_slides(job.input_pptx_path, bundle, output_path)
-            else:
-                self.deck_writer.build_output(job.input_pptx_path, bundle, output_path, qc_report=qc_report)
+            try:
+                if use_reference_only_insertion and self.deck_writer.can_build_reference_only_output_by_package_patch():
+                    self.deck_writer.build_reference_only_output_by_package_patch(
+                        job.input_pptx_path,
+                        bundle,
+                        output_path,
+                    )
+                else:
+                    self.deck_writer.build_output(job.input_pptx_path, bundle, output_path, qc_report=qc_report)
+            except Exception as exc:
+                if self._should_retry_with_powerpoint_native_output(ai_qc_enabled=ai_qc_enabled, error=exc):
+                    self._update_job(
+                        job_id,
+                        step="Corrupted embedded PPT media detected; retrying output assembly in PowerPoint",
+                    )
+                    self.renderer.build_output_with_reference_slides(job.input_pptx_path, bundle, output_path)
+                else:
+                    raise
+
+            self._update_job(job_id, step="Publishing output deck to Downloads")
+            published_output_path = self._publish_output_pptx(output_path, output_name)
+            self._update_job(job_id, step="Opening output deck")
+            self._open_output_pptx(published_output_path)
 
             self._update_job(
                 job_id,
                 status=JobState.COMPLETED.value,
                 step="Complete",
-                output_pptx_path=output_path,
+                output_pptx_path=published_output_path,
             )
         except Exception as exc:
             logger.exception("Job failed", extra={"job_id": job_id})
@@ -353,12 +376,62 @@ class JobManager:
                 error=str(exc),
             )
 
+    def _build_reference_only_placement_bundle(
+        self,
+        source_pptx_path: Path,
+        reference_pages: list[PageImage],
+        placed_dir: Path,
+    ) -> tuple[PlacementBundle, dict[int, SlideQcResult], int]:
+        slide_count, target_size = self._read_pptx_slide_metrics(source_pptx_path)
+        total_pages = max(len(reference_pages), slide_count)
+        bundle = PlacementBundle()
+        slide_qc_results_by_index: dict[int, SlideQcResult] = {}
+
+        for index in range(total_pages):
+            if index < len(reference_pages) and index < slide_count:
+                bundle.slide_results.append(
+                    self.background_composer.prepare_reference_page(
+                        reference_page=reference_pages[index],
+                        target_size=target_size,
+                        output_path=placed_dir / f"background-{index + 1:03d}.png",
+                    )
+                )
+            elif index < slide_count:
+                bundle.slide_results.append(self.background_composer.no_matching_pdf_page(candidate_slide_index=index))
+                slide_qc_results_by_index[index] = self._missing_reference_qc_result(index)
+            else:
+                bundle.extra_reference_results.append(
+                    self.background_composer.prepare_extra_reference_page(
+                        reference_page=reference_pages[index],
+                        target_size=target_size,
+                        output_path=placed_dir / f"extra-{index + 1:03d}.png",
+                    )
+                )
+
+        return bundle, slide_qc_results_by_index, total_pages
+
+    def _read_pptx_slide_metrics(self, pptx_path: Path) -> tuple[int, tuple[int, int]]:
+        with zipfile.ZipFile(pptx_path, "r") as archive:
+            presentation_root = ET.fromstring(archive.read("ppt/presentation.xml"))
+
+        slide_id_list = presentation_root.find(f"{{{PRESENTATION_NS}}}sldIdLst")
+        slide_count = len(list(slide_id_list)) if slide_id_list is not None else 0
+
+        slide_size = presentation_root.find(f"{{{PRESENTATION_NS}}}sldSz")
+        if slide_size is None:
+            raise RuntimeError("The PowerPoint package is missing slide size metadata.")
+
+        slide_width_emu = int(slide_size.get("cx", "0"))
+        slide_height_emu = int(slide_size.get("cy", "0"))
+        slide_width = max(1, int(round((float(slide_width_emu) / EMU_PER_INCH) * self.settings.render_dpi)))
+        slide_height = max(1, int(round((float(slide_height_emu) / EMU_PER_INCH) * self.settings.render_dpi)))
+        return slide_count, (slide_width, slide_height)
+
     def _run_openai_qc(
         self,
         job_id: str,
         matched_pairs: list[tuple[int, PageImage, PageImage]],
         *,
-        reference_layouts,
         candidate_layouts,
         prompt_override: Optional[str] = None,
         prompt_config: Optional[dict[str, str]] = None,
@@ -374,7 +447,6 @@ class JobManager:
                     index=index,
                     reference_page=reference_page,
                     candidate_page=candidate_page,
-                    reference_layout=reference_layouts[index] if index < len(reference_layouts) else None,
                     candidate_layout=candidate_layouts[index] if index < len(candidate_layouts) else None,
                     debug_output_dir=job_qc_inputs_dir / f"slide-{index + 1:03d}",
                     prompt_override=prompt_override,
@@ -413,7 +485,6 @@ class JobManager:
         index: int,
         reference_page: PageImage,
         candidate_page: PageImage,
-        reference_layout=None,
         candidate_layout=None,
         debug_output_dir: Path,
         prompt_override: Optional[str] = None,
@@ -425,7 +496,6 @@ class JobManager:
             page_index=index,
             reference_page=reference_page,
             candidate_page=candidate_page,
-            reference_layout=reference_layout,
             candidate_layout=candidate_layout,
             debug_output_dir=debug_output_dir,
             prompt_override=prompt_override,
@@ -505,6 +575,20 @@ class JobManager:
             note="No matching PDF page exists for this slide.",
         )
 
+    def _should_retry_with_powerpoint_native_output(self, *, ai_qc_enabled: bool, error: Exception) -> bool:
+        if ai_qc_enabled:
+            return False
+        if not self.renderer.can_build_output_with_reference_slides():
+            return False
+        if isinstance(error, zipfile.BadZipFile):
+            return True
+        message = str(error)
+        if "Bad CRC-32 for file 'ppt/media/" in message:
+            return True
+        if "bad CRC" in message and "ppt/media/" in message:
+            return True
+        return False
+
     def _update_job(self, job_id: str, **changes) -> None:
         with self._lock:
             job = self._jobs[job_id]
@@ -516,6 +600,36 @@ class JobManager:
         upload.file.seek(0)
         with destination.open("wb") as handle:
             shutil.copyfileobj(upload.file, handle)
+
+    def _publish_output_pptx(self, source_path: Path, output_name: str) -> Path:
+        destination_path = self.settings.downloads_dir / output_name
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_destination = destination_path.with_name(f".{destination_path.name}.tmp")
+        if temp_destination.exists():
+            temp_destination.unlink()
+        shutil.copy2(source_path, temp_destination)
+        temp_destination.replace(destination_path)
+        return destination_path
+
+    def _open_output_pptx(self, output_path: Path) -> None:
+        try:
+            if self.settings.platform_name == "windows":
+                os.startfile(str(output_path))
+                return
+            if self.settings.platform_name == "darwin":
+                subprocess.Popen(
+                    ["open", str(output_path)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return
+            subprocess.Popen(
+                ["xdg-open", str(output_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            logger.warning("Failed to open output deck automatically.", exc_info=True, extra={"output_path": str(output_path)})
 
     def _cleanup_expired_runs(self) -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=self.settings.cleanup_after_hours)

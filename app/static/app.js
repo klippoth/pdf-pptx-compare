@@ -8,12 +8,6 @@ const statusMeta = document.getElementById("status-meta");
 const meterBar = document.getElementById("meter-bar");
 const downloadLink = document.getElementById("download-link");
 const errorCopy = document.getElementById("error-copy");
-const fontPanel = document.getElementById("font-panel");
-const fontSummary = document.getElementById("font-summary");
-const fontUniqueSummary = document.getElementById("font-unique-summary");
-const fontUniqueDetails = document.getElementById("font-unique-details");
-const fontUniqueList = document.getElementById("font-unique-list");
-const fontGrid = document.getElementById("font-grid");
 
 const uploadInput = document.getElementById("upload-input");
 const pdfInput = document.getElementById("pdf-input");
@@ -25,6 +19,8 @@ const runtimeNote = document.getElementById("runtime-note");
 const submitStateNote = document.getElementById("submit-state-note");
 const dropzone = document.querySelector(".dropzone");
 const aiQcToggle = document.getElementById("ai-qc-toggle");
+const aiQcToggleRow = document.querySelector('label[for="ai-qc-toggle"]');
+const aiQcToggleNote = document.querySelector(".toggle-note");
 const promptOpenButton = document.getElementById("prompt-open-button");
 const promptModal = document.getElementById("prompt-modal");
 const promptModalBackdrop = document.getElementById("prompt-modal-backdrop");
@@ -46,6 +42,8 @@ let activeSubmissionFingerprint = null;
 let lastCompletedSubmission = null;
 let rendererCanConvert = true;
 let rendererMessage = "";
+let aiQcSupported = true;
+let aiQcAvailable = false;
 const lastCompletedStorageKey = "pdf-to-pptx-last-completed-pair";
 const promptConfigStorageKey = "pdf-to-pptx-qc-prompt-config-v1";
 const apiOrigin =
@@ -99,7 +97,7 @@ let defaultPromptConfig = null;
 const buildSelectedPairFingerprint = (
   pdfFile,
   pptxFile,
-  aiQcEnabled = aiQcToggle?.checked ?? true,
+  aiQcEnabled = aiQcToggle?.checked ?? false,
   promptConfig = getCurrentPromptConfig(),
 ) => {
   if (!pdfFile || !pptxFile) {
@@ -131,7 +129,7 @@ const formatCompletedAt = (isoValue) => {
 };
 
 const getCurrentSelectionFingerprint = () => {
-  return buildSelectedPairFingerprint(pdfInput.files?.[0], pptxInput.files?.[0], aiQcToggle?.checked ?? true);
+  return buildSelectedPairFingerprint(pdfInput.files?.[0], pptxInput.files?.[0], aiQcToggle?.checked ?? false);
 };
 
 const getDefaultPromptConfig = () =>
@@ -214,7 +212,7 @@ const updatePromptStatus = () => {
   if (!promptSaveStatus) {
     return;
   }
-  if (!(aiQcToggle?.checked ?? true)) {
+  if (!(aiQcToggle?.checked ?? false)) {
     promptSaveStatus.textContent = isDefault
       ? "AI QC is off. The editor currently matches the default prompts."
       : "AI QC is off. The editor currently contains custom prompts.";
@@ -260,7 +258,7 @@ window.__openPromptEditor = (source = "unknown") => {
 };
 
 const updatePromptAvailability = () => {
-  const aiEnabled = aiQcToggle?.checked ?? true;
+  const aiEnabled = (aiQcToggle?.checked ?? false) && aiQcSupported && aiQcAvailable;
   debugLog("updatePromptAvailability", { aiEnabled });
   [qcGeneralSystemPrompt, qcGeneralUserPrompt, qcTextSystemPrompt, qcTextUserPrompt].forEach((field) => {
     if (field) {
@@ -301,6 +299,38 @@ const applyRendererStatus = (renderer) => {
     runtimeNote.textContent = rendererMessage || "No supported converter is available on this machine.";
     runtimeNote.classList.remove("hidden");
   }
+};
+
+const applyAiQcAvailability = ({ supported, available }) => {
+  aiQcSupported = Boolean(supported);
+  aiQcAvailable = Boolean(available);
+  const aiControlsVisible = aiQcSupported && aiQcAvailable;
+
+  if (aiQcToggle) {
+    if (!aiControlsVisible) {
+      aiQcToggle.checked = false;
+    }
+    aiQcToggle.disabled = !aiControlsVisible;
+  }
+  if (aiQcToggleRow) {
+    aiQcToggleRow.classList.toggle("hidden", !aiControlsVisible);
+  }
+  if (aiQcToggleNote) {
+    aiQcToggleNote.classList.toggle("hidden", !aiControlsVisible);
+  }
+  if (promptOpenButton) {
+    promptOpenButton.classList.toggle("hidden", !aiControlsVisible);
+  }
+
+  if (!aiQcSupported) {
+    runtimeHelper.textContent =
+      "This build is configured for PDF reference insertion only. AI QC is disabled.";
+  } else if (!aiQcAvailable) {
+    runtimeHelper.textContent =
+      "AI QC is unavailable in this build because no OpenAI API key is configured.";
+  }
+
+  updatePromptAvailability();
 };
 
 const updateSubmitAvailability = () => {
@@ -365,61 +395,6 @@ const setDragState = (element, active) => {
   element.classList.toggle("drag-active", active);
 };
 
-const escapeHtml = (value) =>
-  String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-
-const parsePageCountMap = (value) => {
-  const counts = {};
-  for (const [pageKey, pageCount] of Object.entries(value || {})) {
-    const pageNumber = Number.parseInt(pageKey, 10);
-    if (!Number.isNaN(pageNumber)) {
-      counts[pageNumber] = Number(pageCount) || 0;
-    }
-  }
-  return counts;
-};
-
-const sumCounts = (counts) => Object.values(counts || {}).reduce((total, count) => total + (Number(count) || 0), 0);
-
-const allocatePercentages = (items, total, getCount) => {
-  if (!items.length || total <= 0) {
-    return items.map(() => 0);
-  }
-
-  const working = items.map((item, index) => {
-    const raw = (getCount(item) / total) * 100;
-    const floored = Math.floor(raw);
-    return {
-      index,
-      floored,
-      fraction: raw - floored,
-    };
-  });
-
-  let remainder = 100 - working.reduce((totalFloor, item) => totalFloor + item.floored, 0);
-  working.sort((left, right) => right.fraction - left.fraction || left.index - right.index);
-  while (remainder > 0 && working.length) {
-    for (const item of working) {
-      if (remainder <= 0) {
-        break;
-      }
-      item.floored += 1;
-      remainder -= 1;
-    }
-  }
-
-  const percentages = new Array(items.length).fill(0);
-  working.forEach((item) => {
-    percentages[item.index] = item.floored;
-  });
-  return percentages;
-};
-
 const assignSelectedFiles = (fileList) => {
   const files = Array.from(fileList || []);
   if (!files.length) {
@@ -456,88 +431,6 @@ const assignSelectedFiles = (fileList) => {
   errorCopy.classList.add("hidden");
 };
 
-const renderFonts = (fonts, pdfPageCount = 0, pdfPageCharacterTotals = {}) => {
-  const pageTotals = parsePageCountMap(pdfPageCharacterTotals);
-  const pageNumbers =
-    pdfPageCount > 0
-      ? Array.from({ length: pdfPageCount }, (_, index) => index + 1)
-      : [...new Set(fonts.flatMap((font) => font.pageNumbers || []))].sort((left, right) => left - right);
-
-  if (!fonts?.length && !pageNumbers.length) {
-    fontPanel.classList.add("hidden");
-    fontUniqueSummary.textContent = "Unique fonts";
-    fontUniqueList.innerHTML = "";
-    fontGrid.innerHTML = "";
-    return;
-  }
-
-  const embeddedCount = fonts.filter((font) => font.embedded).length;
-  const totalDocumentCharacters = sumCounts(pageTotals);
-  fontSummary.textContent =
-    totalDocumentCharacters > 0
-      ? `${embeddedCount} embedded / ${fonts.length} unique fonts across ${pageNumbers.length} pages · percentages based on extracted text`
-      : `${embeddedCount} embedded / ${fonts.length} unique fonts across ${pageNumbers.length} pages · font presence detected, but no extractable text split available`;
-  fontUniqueSummary.textContent = `Unique fonts (${fonts.length})`;
-  fontUniqueDetails.open = totalDocumentCharacters <= 0;
-  const overallPercentages = allocatePercentages(fonts, totalDocumentCharacters, (font) => sumCounts(font.pageCharacterCounts));
-  fontUniqueList.innerHTML = fonts.length
-    ? fonts
-        .map((font, index) => {
-          const documentShare = overallPercentages[index];
-          const countedCharacters = sumCounts(font.pageCharacterCounts);
-          const pagesLabel = font.pageNumbers?.length ? font.pageNumbers.join(", ") : "none";
-          const flags = [];
-          flags.push(font.embedded ? "embedded" : "not embedded");
-          if (font.subset) {
-            flags.push("subset");
-          }
-          const detailLine = totalDocumentCharacters > 0
-            ? `${documentShare}% of extracted text · ${countedCharacters} chars · pages ${pagesLabel}`
-            : `detected on pages ${pagesLabel} · ${flags.join(" · ")}`;
-          return `<article class="font-card"><strong>${escapeHtml(font.name)}</strong><span>${escapeHtml(font.fontType)} · ${escapeHtml(flags.join(" · "))}</span><small>${escapeHtml(detailLine)}</small></article>`;
-        })
-        .join("")
-    : `<p class="font-empty-copy">No extractable text fonts detected in the PDF.</p>`;
-
-  const rows = pageNumbers
-    .map((pageNumber) => {
-      const pageTotal = pageTotals[pageNumber] || 0;
-      const pageFonts = fonts
-        .filter((font) => Number(font.pageCharacterCounts?.[pageNumber] || 0) > 0)
-        .sort((left, right) => {
-          const rightCount = Number(right.pageCharacterCounts?.[pageNumber] || 0);
-          const leftCount = Number(left.pageCharacterCounts?.[pageNumber] || 0);
-          return rightCount - leftCount || left.name.localeCompare(right.name);
-        });
-
-      if (!pageTotal || !pageFonts.length) {
-        const detectedFonts = fonts
-          .filter((font) => (font.pageNumbers || []).includes(pageNumber))
-          .sort((left, right) => left.name.localeCompare(right.name));
-        if (!detectedFonts.length) {
-          return `<tr><th scope="row">Page ${pageNumber}</th><td><span class="font-tag font-tag-empty">No fonts detected</span></td></tr>`;
-        }
-        const fallbackTags = detectedFonts
-          .map((font) => {
-            return `<span class="font-tag font-tag-fallback" title="${escapeHtml(font.fontType)}">${escapeHtml(font.name)} <small>detected</small></span>`;
-          })
-          .join("");
-        return `<tr><th scope="row">Page ${pageNumber}</th><td>${fallbackTags}</td></tr>`;
-      }
-
-      const percentages = allocatePercentages(pageFonts, pageTotal, (font) => Number(font.pageCharacterCounts?.[pageNumber] || 0));
-      const tags = pageFonts
-        .map((font, index) => {
-          return `<span class="font-tag" title="${escapeHtml(font.fontType)}">${escapeHtml(font.name)} <small>${percentages[index]}%</small></span>`;
-        })
-        .join("");
-      return `<tr><th scope="row">Page ${pageNumber}</th><td>${tags}</td></tr>`;
-    })
-    .join("");
-  fontGrid.innerHTML = `<thead><tr><th scope="col">Page</th><th scope="col">Fonts used on page</th></tr></thead><tbody>${rows}</tbody>`;
-  fontPanel.classList.remove("hidden");
-};
-
 const ensureBackendAvailable = async () => {
   if (!apiOrigin) {
     throw new Error(backendUnavailableMessage());
@@ -550,6 +443,10 @@ const ensureBackendAvailable = async () => {
     }
     const payload = await response.json();
     applyRendererStatus(payload.renderer);
+    applyAiQcAvailability({
+      supported: payload.aiQcSupported,
+      available: payload.aiQcAvailable,
+    });
     updateSubmitAvailability();
     if (!payload.renderer?.canConvert) {
       throw new Error(payload.renderer?.message || "No supported converter is available on this machine.");
@@ -705,39 +602,56 @@ if (promptResetButton) {
 }
 
 const updateStatus = (job) => {
-  statusPanel.classList.remove("hidden");
-  statusBadge.textContent = job.status;
-  statusStep.textContent = job.step;
-  statusMeta.textContent = `${job.slideProgress} / ${job.slideCount} slides processed`;
+  statusPanel?.classList.remove("hidden");
+  if (statusBadge) {
+    statusBadge.textContent = job.status;
+  }
+  if (statusStep) {
+    statusStep.textContent = job.step;
+  }
+  if (statusMeta) {
+    statusMeta.textContent = `${job.slideProgress} / ${job.slideCount} slides processed`;
+  }
 
   const slideCount = Math.max(job.slideCount || 0, 1);
   const percent = Math.min(100, Math.round(((job.slideProgress || 0) / slideCount) * 100));
-  meterBar.style.width = `${percent}%`;
-
-  if (job.status === "queued") {
-    statusTitle.textContent = "Waiting in queue";
-  } else if (job.status === "processing") {
-    statusTitle.textContent = job.aiQcEnabled === false ? "Preparing PDF reference deck" : "Parking PDF references";
-  } else if (job.status === "completed") {
-    statusTitle.textContent = "Updated deck ready";
-  } else {
-    statusTitle.textContent = "Job failed";
+  if (meterBar) {
+    meterBar.style.width = `${percent}%`;
   }
 
-  statusBadge.dataset.state = job.status;
-  renderFonts(job.pdfFonts || [], job.pdfPageCount || 0, job.pdfPageCharacterTotals || {});
+  if (job.status === "queued") {
+    if (statusTitle) {
+      statusTitle.textContent = "Waiting in queue";
+    }
+  } else if (job.status === "processing") {
+    if (statusTitle) {
+      statusTitle.textContent = job.aiQcEnabled === false ? "Preparing PDF reference deck" : "Parking PDF references";
+    }
+  } else if (job.status === "completed") {
+    if (statusTitle) {
+      statusTitle.textContent = "Updated deck ready";
+    }
+  } else {
+    if (statusTitle) {
+      statusTitle.textContent = "Job failed";
+    }
+  }
 
-  if (job.outputReady) {
+  if (statusBadge) {
+    statusBadge.dataset.state = job.status;
+  }
+
+  if (job.outputReady && downloadLink) {
     downloadLink.href = buildApiUrl(`/api/jobs/${job.jobId}/download`);
     downloadLink.classList.remove("hidden");
-  } else {
+  } else if (downloadLink) {
     downloadLink.classList.add("hidden");
   }
 
-  if (job.error) {
+  if (job.error && errorCopy) {
     errorCopy.textContent = job.error;
     errorCopy.classList.remove("hidden");
-  } else {
+  } else if (errorCopy) {
     errorCopy.classList.add("hidden");
   }
 };
@@ -801,8 +715,9 @@ form.addEventListener("submit", async (event) => {
   const data = new FormData();
   data.append("pdf", pdfInput.files[0]);
   data.append("pptx", pptxInput.files[0]);
-  data.append("enable_ai_qc", aiQcToggle?.checked ? "true" : "false");
-  if (aiQcToggle?.checked) {
+  const aiQcEnabledForSubmission = (aiQcToggle?.checked ?? false) && aiQcSupported && aiQcAvailable;
+  data.append("enable_ai_qc", aiQcEnabledForSubmission ? "true" : "false");
+  if (aiQcEnabledForSubmission) {
     const promptConfig = getCurrentPromptConfig();
     data.append("qc_general_system_prompt", promptConfig.generalSystemPrompt);
     data.append("qc_general_user_prompt", promptConfig.generalUserPrompt);
@@ -835,9 +750,6 @@ form.addEventListener("submit", async (event) => {
       slideCount: 0,
       outputReady: false,
       aiQcEnabled: payload.aiQcEnabled,
-      pdfPageCount: 0,
-      pdfPageCharacterTotals: {},
-      pdfFonts: [],
       error: null,
     });
     pollJob(payload.jobId);
@@ -864,19 +776,24 @@ window.addEventListener("DOMContentLoaded", async () => {
   try {
     debugLog("Checking backend availability.");
     await ensureBackendAvailable();
-    debugLog("Backend available. Loading /api/qc-prompts.");
-    const promptResponse = await fetch(buildApiUrl("/api/qc-prompts"), { cache: "no-store" });
-    if (!promptResponse.ok) {
-      throw new Error("Could not load the AI QC prompts.");
+    if (aiQcSupported) {
+      debugLog("Backend available. Loading /api/qc-prompts.");
+      const promptResponse = await fetch(buildApiUrl("/api/qc-prompts"), { cache: "no-store" });
+      if (!promptResponse.ok) {
+        throw new Error("Could not load the AI QC prompts.");
+      }
+      defaultPromptConfig = await promptResponse.json();
+      debugLog("Loaded prompt defaults.", {
+        generalSystemLength: defaultPromptConfig?.generalSystemPrompt?.length || 0,
+        generalUserLength: defaultPromptConfig?.generalUserPrompt?.length || 0,
+        textSystemLength: defaultPromptConfig?.textSystemPrompt?.length || 0,
+        textUserLength: defaultPromptConfig?.textUserPrompt?.length || 0,
+      });
+      applyPromptConfig(readSavedPromptConfig() || defaultPromptConfig);
+    } else {
+      defaultPromptConfig = getDefaultPromptConfig();
+      applyPromptConfig(defaultPromptConfig);
     }
-    defaultPromptConfig = await promptResponse.json();
-    debugLog("Loaded prompt defaults.", {
-      generalSystemLength: defaultPromptConfig?.generalSystemPrompt?.length || 0,
-      generalUserLength: defaultPromptConfig?.generalUserPrompt?.length || 0,
-      textSystemLength: defaultPromptConfig?.textSystemPrompt?.length || 0,
-      textUserLength: defaultPromptConfig?.textUserPrompt?.length || 0,
-    });
-    applyPromptConfig(readSavedPromptConfig() || defaultPromptConfig);
     updatePromptAvailability();
     updatePromptStatus();
     updatePromptEditorState();

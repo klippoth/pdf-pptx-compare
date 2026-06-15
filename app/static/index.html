@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PDF to PPTX Reference Placement</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260508-prompt-debug-1" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260511-ui-fix-1" />
   </head>
   <body>
     <main class="shell">
@@ -49,7 +49,7 @@
             <button id="submit-button" type="submit">Create Updated Deck</button>
             <div class="helper-stack">
               <label class="toggle-row" for="ai-qc-toggle">
-                <input id="ai-qc-toggle" type="checkbox" checked />
+                <input id="ai-qc-toggle" type="checkbox" />
                 <span>Enable AI QC annotations</span>
               </label>
               <p class="toggle-note">
@@ -65,7 +65,7 @@
           </div>
 
           <div class="panel-footer">
-            <span class="build-badge">UI build 20260508-prompt-debug-1</span>
+            <span class="build-badge">UI build 20260511-ui-fix-1</span>
             <button
               id="prompt-open-button"
               class="utility-button utility-button-plain"
@@ -150,23 +150,10 @@
         </div>
 
         <a id="download-link" class="download-link hidden" href="#">Download updated PPTX</a>
-
-        <div id="font-panel" class="font-panel hidden">
-          <h3>PDF Fonts</h3>
-          <p id="font-summary" class="font-summary"></p>
-          <details id="font-unique-details" class="font-unique-details">
-            <summary id="font-unique-summary">Unique fonts</summary>
-            <div id="font-unique-list" class="font-unique-list"></div>
-          </details>
-          <div class="font-page-wrap">
-            <table id="font-grid" class="font-grid"></table>
-          </div>
-        </div>
-
         <p id="error-copy" class="error-copy hidden"></p>
       </section>
     </main>
 
-    <script src="/static/app.js?v=20260508-prompt-debug-1" defer></script>
+    <script src="/static/app.js?v=20260511-ui-fix-1" defer></script>
   </body>
 </html>

@@ -208,9 +208,6 @@ class JobRecord:
     slide_progress: int = 0
     slide_count: int = 0
     output_pptx_path: Optional[Path] = None
-    pdf_font_report_path: Optional[Path] = None
-    pdf_fonts: list[PDFFontInfo] = field(default_factory=list)
-    pdf_page_character_totals: dict[int, int] = field(default_factory=dict)
     pdf_page_count: int = 0
     qc_report_path: Optional[Path] = None
     qc_counts_by_type: dict[str, int] = field(default_factory=dict)

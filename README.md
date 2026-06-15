@@ -70,7 +70,6 @@ Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
 - Automatically uses Microsoft PowerPoint when LibreOffice is not installed but PowerPoint is available on the machine
 - Can still force PowerPoint fallback behavior with `PDF_PPTX_ENABLE_POWERPOINT_FALLBACK=1`
 - Rasterizes both PDFs into page images
-- Detects fonts used in the uploaded PDF and records whether they appear embedded
 - Runs rendered-slide QC against the exported PPTX PDF and the reference PDF
 - Uses parallelized GPT slide-by-slide image comparison when `OPENAI_API_KEY` is configured
 - Sends the rendered PDF page and the rendered PPT slide as the two image inputs for each comparison
@@ -85,7 +84,6 @@ Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
 - Inserts a full-slide PDF screenshot immediately after each matched PPTX slide for slide-by-slide review, with the slide and screenshot shape name set to `PDF_ORIGINAL`
 - Appends unmatched PDF pages as full-slide reference slides at the end of the deck
 - Returns `<original-name>_with_pdf_pages.pptx`
-- Writes a sidecar font report to `runs/<job_id>/output/pdf_fonts.json`
 - Writes a sidecar QC report to `runs/<job_id>/output/qc_report.json`
 
 ## Notes
@@ -145,6 +143,20 @@ That produces `dist-windows\PDFtoPPTXReference\`. Zip that whole folder and send
 
 If `.env.local` exists in the project root when you build, the script copies it into the packaged folder automatically. That is the easiest way to distribute a project-specific OpenAI key with the bundle.
 
+If you want a no-AI Windows build that hides AI QC and bundles no OpenAI key:
+
+```powershell
+$env:PDF_PPTX_BUILD_NO_AI = "1"
+.\scripts\build_windows_bundle.ps1
+```
+
+If you want to skip bundling your existing `.env.local` without forcing a no-AI build:
+
+```powershell
+$env:PDF_PPTX_BUNDLE_LOCAL_ENV = "0"
+.\scripts\build_windows_bundle.ps1
+```
+
 Note:
 
 - The Windows build script intentionally uses `.venv-windows` so it does not conflict with a macOS `.venv` when the project is opened through a Parallels shared folder.
@@ -169,6 +181,38 @@ That produces `dist/PDFtoPPTXReference.app` and you can zip it for sharing.
 
 If `.env.local` exists in the project root when you build, the script copies it into `PDFtoPPTXReference.app/Contents/MacOS/.env.local` automatically.
 
+If you want a no-AI Mac build that hides AI QC and bundles no OpenAI key:
+
+```bash
+PDF_PPTX_BUILD_NO_AI=1 ./scripts/build_macos_bundle.sh
+```
+
+or for a DMG:
+
+```bash
+PDF_PPTX_BUILD_NO_AI=1 ./scripts/build_macos_dmg.sh
+```
+
+The no-AI Mac build also skips bundling the PowerPoint add-ins, because the non-AI workflow no longer depends on them.
+
+If you want to skip bundling your existing `.env.local` without forcing a no-AI build:
+
+```bash
+PDF_PPTX_BUNDLE_LOCAL_ENV=0 ./scripts/build_macos_bundle.sh
+```
+
+If the following files exist locally, the Mac build can also bundle them into `dist/PowerPoint Add-ins/` for distribution alongside the app:
+
+- `ImageExport.ppam`
+- `PDF-PPT_Helper.ppam`
+- `PDF-PPT_Helper.pptm`
+
+By default the script looks for those files on your Desktop. You can override the source paths with:
+
+- `PDF_PPTX_IMAGEEXPORT_PPAM`
+- `PDF_PPTX_REFERENCE_HELPER_PPAM`
+- `PDF_PPTX_REFERENCE_HELPER_PPTM`
+
 If you want a more normal Mac handoff as a disk image:
 
 ```bash
@@ -178,6 +222,7 @@ If you want a more normal Mac handoff as a disk image:
 That produces `deliverables/PDFtoPPTXReference-macOS.dmg` containing:
 
 - `PDFtoPPTXReference.app`
+- `PowerPoint Add-ins/` (when available)
 - `RECIPIENT_MAC_README.txt`
 - an `Applications` shortcut
 
@@ -185,6 +230,8 @@ Important:
 
 - The packaged app still needs a renderer on the recipient machine
 - LibreOffice is used first when available
+- The non-AI Mac workflow does not require the PowerPoint add-ins
+- The PowerPoint add-ins are only needed for the Mac AI/QC automation path
 - If LibreOffice is missing but Microsoft PowerPoint is installed, the app will use PowerPoint automatically on macOS
 - Because the app is not notarized, macOS may show a Gatekeeper warning the first time it is opened
 - Anyone who receives a build with `.env.local` inside it can extract and reuse that API key, so only do this for trusted internal colleagues.

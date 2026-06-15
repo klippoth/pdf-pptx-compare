@@ -62,6 +62,26 @@ class BackgroundComposer:
             similarity_score=best.similarity_score,
         )
 
+    def prepare_reference_page(
+        self,
+        reference_page: PageImage,
+        target_size: tuple[int, int],
+        output_path: Path,
+    ) -> PagePlacementResult:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        best = self._best_candidate(reference_page.image, None, target_size=target_size)
+        self._add_reference_border(Image.fromarray(best.canvas)).save(output_path)
+
+        return PagePlacementResult(
+            candidate_slide_index=reference_page.page_index,
+            reference_page_index=reference_page.page_index,
+            status=PlacementStatus.PLACED,
+            background_image_path=output_path,
+            message="Prepared the PDF page as a full-slide reference image",
+            rotation_degrees=best.angle,
+            similarity_score=best.similarity_score,
+        )
+
     def no_matching_pdf_page(self, candidate_slide_index: int) -> PagePlacementResult:
         return PagePlacementResult(
             candidate_slide_index=candidate_slide_index,

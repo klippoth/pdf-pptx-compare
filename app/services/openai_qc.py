@@ -12,7 +12,7 @@ import hashlib
 from typing import Literal, Optional
 import unicodedata
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field
 
 from app.services.models import (
@@ -28,70 +28,43 @@ from app.services.models import (
 )
 
 DEFAULT_GENERAL_SYSTEM_PROMPT = (
-    "You are a slide quality-control reviewer focused on obvious visual discrepancies. Compare a "
-    "reference PDF page image against a candidate PowerPoint slide render. The PDF reference is "
-    "always the source of truth. Report only obvious visual content mistakes in these categories: "
-    "missing_content, extra_content, wrong_color, and line_break_issue. "
-    "Treat missing_content as shapes or elements present in the reference but absent in the "
-    "candidate. Treat extra_content as shapes or elements that appear in the candidate but should "
-    "not be there. Treat wrong_color only as a significant and obvious font/text color mismatch on readable text. "
-    "Do not report general fill, accent, image, or chart color differences. Treat line_break_issue "
-    "only as an unmistakable visual wrap or split. Ignore wrong_text in this pass entirely. Do not "
-    "report chart size/position, alignment, or positioning issues in this pass. "
-    "Work methodically: compare the two full-slide images, scan them top-to-bottom and left-to-right, "
-    "then re-check every finding against the full images before returning it. Ignore subtle layout drift, "
-    "tiny spacing changes, minor font changes, and negligible rendering noise. Return bounding boxes "
-    "in normalized candidate-image coordinates [x0, y0, x1, y1] between 0 and 1."
+    "You are a slide quality-control reviewer using a visual-first workflow. Compare a recreated "
+    "PowerPoint slide against the original PDF reference. The PDF reference is always the source of truth. "
+    "You will receive a labeled side-by-side comparison panel plus the original PPTX candidate image and "
+    "the original PDF reference image. Use the side-by-side panel to orient yourself, then use the original "
+    "images to verify details and return bounding boxes in normalized PPTX candidate-image coordinates "
+    "[x0, y0, x1, y1] between 0 and 1. Report only obvious discrepancies in these categories: "
+    "missing_content, extra_content, wrong_text, and wrong_color. Treat wrong_color only as a significant "
+    "and obvious font/text color mismatch on readable text. Do not report general fill, accent, chart, or "
+    "image color differences. Do not report line breaks or wrapping in this version. Do not report chart "
+    "size/position, alignment, or general positioning issues. Work methodically from top to bottom and left "
+    "to right. Re-check every finding against the original images before returning it. Ignore subtle layout "
+    "drift, tiny spacing changes, and negligible rendering noise."
 )
 
 DEFAULT_GENERAL_USER_PROMPT = (
-    "Image 1 is the full candidate PowerPoint slide. Image 2 is the full reference PDF "
-    "page. Focus on obvious missing shapes/elements, extra elements, significant obvious font/text color "
-    "mismatches on readable text, and obvious line-break/render splits only. Do "
-    "not report text spelling or wording issues in this pass."
+    "Image 1 is a labeled side-by-side comparison panel: the left side is the PPTX candidate slide and the "
+    "right side is the PDF reference page. Image 2 is the original PPTX candidate slide. Image 3 is the "
+    "original PDF reference page. Use the original PPTX candidate image as the coordinate system for any "
+    "returned bounding box. Focus on obvious missing elements, extra elements, visible text differences, and "
+    "significant obvious font/text color mismatches only. Do not report line-wrap issues. Ignore chart "
+    "size/alignment/position changes. Ignore tiny edge-only discrepancies unless there is a clearly real border "
+    "element or footer element missing or extra there."
 )
 
 DEFAULT_TEXT_SYSTEM_PROMPT = (
-    "You are a slide quality-control reviewer focused only on visible text discrepancies. Compare "
-    "a reference PDF page image against a candidate PowerPoint slide render. The PDF reference is "
-    "always the source of truth. Report only wrong_text findings in this pass. Treat wrong_text "
-    "as clearly visible differences in wording, spelling, typos, names, dates, numbers, "
-    "punctuation, capitalization when meaningful, or missing/extra text. Spell-check visible text "
-    "carefully against the reference, especially names, company names, presenter names, titles, "
-    "dates, and numbers. "
-    "Obvious readable typos and misspellings should be treated as high-signal wrong_text findings, "
-    "even if only one or two characters differ. Use any extracted text and deterministic text-diff "
-    "checklist as strong evidence, but still verify against the images before returning a finding. "
-    "If a deterministic text-diff checklist is provided, only report wrong_text findings that match "
-    "one of those listed mismatches or another clearly extracted-text mismatch visible in both image "
-    "and text evidence. If the extracted texts match, do not invent a typo correction. "
-    "Internally review the slide in ordered passes from top to bottom and left to right. For text "
-    "verification, check suspicious lines one by one and compare each candidate line directly against "
-    "the matching reference line before returning a finding. Also verify every proposed finding a second "
-    "time before returning it. Do not proofread, rewrite, improve grammar, or suggest better phrasing. "
-    "Do not normalize wording. Ignore color, shapes, charts, and general layout drift in this pass. "
-    "If extracted text is missing or incomplete for a readable region, still do a careful visual text "
-    "check there. This is especially important for short chart labels, superscripts, symbols, currency "
-    "markers, percentages, and other small text that extraction may miss. "
-    "Return bounding boxes in normalized candidate-image coordinates [x0, y0, x1, y1] between 0 and 1."
+    "Supplemental text verification rules for the same single visual pass: use extracted PPTX slide text only "
+    "as supporting context for the candidate side. Do not rely on extracted PDF text. Treat wrong_text as a "
+    "clearly visible wording, spelling, typo, name, date, number, symbol, punctuation, currency marker, or "
+    "percentage difference between the PPTX candidate image and the PDF reference image. Be especially careful "
+    "with short labels, chart labels, superscripts, footnotes, and small numeric text. Do not proofread, "
+    "rewrite grammar, normalize wording, or invent corrections that are not visibly supported by the images."
 )
 
 DEFAULT_TEXT_USER_PROMPT = (
-    "Image 1 is the candidate PowerPoint slide. Image 2 is the reference PDF page. "
-    "Review only visible text discrepancies. Check these areas in order: titles, "
-    "subtitles, body text, footer text, presenter names, dates, and numbers, scanning "
-    "from top to bottom and left to right. If a "
-    "deterministic text-diff checklist is provided, treat it as a prioritized list of "
-    "suspected text issues to confirm or reject. Work through those suspicious text "
-    "items line by line, and only report wrong_text if it aligns "
-    "with one of those mismatches or another clear extracted-text mismatch. If readable visible text differs by one or "
-    "more letters, digits, or punctuation marks, treat it as wrong_text. This includes "
-    "obvious typos, misspellings, dropped letters, extra letters, swapped letters, and "
-    "repeated letters. If a region looks the same in both images on the second check, do "
-    "not report a discrepancy there. Do not correct grammar, normalize wording, or call "
-    "out preferred wording. Do not infer what the text probably meant. If the extracted "
-    "text does not cover a readable text element, still verify that text visually from the "
-    "images before deciding whether it differs."
+    "Candidate PowerPoint text extracted from the PPTX file will be provided as supporting context. Use it only "
+    "to sanity-check shaky or small regions on the candidate side. The final decision for wrong_text must still "
+    "be based on visible evidence in the images."
 )
 
 PROMPT_CONFIG_KEYS = (
@@ -179,84 +152,56 @@ class OpenAIQCEvaluator:
         prompt_override: Optional[str] = None,
         prompt_config: Optional[dict[str, str]] = None,
     ) -> SlideQcResult:
-        candidate_image, reference_image, reference_fit = self._prepare_comparison_images(
+        candidate_image, reference_image = self._prepare_comparison_images(
             candidate_page=candidate_page,
             reference_page=reference_page,
         )
-        text_discrepancies = self._collect_text_discrepancies(
-            reference_layout=reference_layout,
-            candidate_layout=candidate_layout,
+        comparison_panel = self._build_side_by_side_comparison(
+            candidate_image=candidate_image,
+            reference_image=reference_image,
         )
         candidate_text_regions = self._collect_candidate_text_regions(candidate_layout)
-        text_context = self._build_text_context(
-            reference_layout=reference_layout,
-            candidate_layout=candidate_layout,
-            text_discrepancies=text_discrepancies,
-        )
+        text_context = self._build_text_context(candidate_layout=candidate_layout)
         if debug_output_dir is not None:
             self._save_debug_inputs(
                 debug_output_dir=debug_output_dir,
+                comparison_panel=comparison_panel,
                 candidate_image=candidate_image,
                 reference_image=reference_image,
                 prompt_override=prompt_override,
                 prompt_config=prompt_config,
             )
 
-        general_parsed = self._invoke_general_model(
-            candidate_image=candidate_image,
-            reference_image=reference_image,
-            prompt_override=prompt_override,
-            prompt_config=prompt_config,
-        )
-        text_parsed = self._invoke_text_model(
+        parsed = self._invoke_visual_model(
+            comparison_panel=comparison_panel,
             candidate_image=candidate_image,
             reference_image=reference_image,
             text_context=text_context,
-            text_discrepancies=text_discrepancies,
-            reference_fit=reference_fit,
             prompt_override=prompt_override,
             prompt_config=prompt_config,
         )
 
-        kept_general_findings = self._materialize_findings(
-            general_parsed.findings,
+        findings = self._materialize_findings(
+            parsed.findings,
             allowed_types={
                 QcFindingType.MISSING_CONTENT,
                 QcFindingType.EXTRA_CONTENT,
+                QcFindingType.WRONG_TEXT,
                 QcFindingType.WRONG_COLOR,
-                QcFindingType.LINE_BREAK_ISSUE,
             },
             next_finding_id=1,
         )
-        kept_general_findings = self._filter_general_findings(
-            kept_general_findings,
+        findings = self._filter_visual_findings(
+            findings,
             candidate_text_regions=candidate_text_regions,
         )
-        kept_text_findings = self._filter_text_findings_against_support(
-            self._materialize_findings(
-                text_parsed.findings,
-                allowed_types={QcFindingType.WRONG_TEXT},
-                next_finding_id=len(kept_general_findings) + 1,
-            ),
-            text_discrepancies=text_discrepancies,
-            candidate_text_regions=candidate_text_regions,
-        )
-        findings: list[SlideQcFinding] = []
-        findings.extend(kept_general_findings)
-        findings.extend(kept_text_findings)
         findings = self._deduplicate_findings(findings)
         for finding_id, finding in enumerate(findings, start=1):
             finding.finding_id = finding_id
 
-        status = self._merge_statuses(general_parsed.status, text_parsed.status, findings)
-        summary, bullets, note = self._merge_comments(
-            general_result=general_parsed,
-            text_result=text_parsed,
-            general_kept_findings=kept_general_findings,
-            text_kept_findings=kept_text_findings,
-            findings=findings,
-        )
-        comparison_confidence = (float(general_parsed.comparison_confidence) + float(text_parsed.comparison_confidence)) / 2.0
+        status = self._merge_statuses(parsed.status, parsed.status, findings)
+        summary, bullets, note = self._comments_for_output(parsed, findings)
+        comparison_confidence = float(parsed.comparison_confidence)
 
         return SlideQcResult(
             slide_index=slide_index,
@@ -271,77 +216,48 @@ class OpenAIQCEvaluator:
             note=note,
         )
 
-    def _invoke_general_model(
+    def _invoke_visual_model(
         self,
         *,
-        candidate_image: Image.Image,
-        reference_image: Image.Image,
-        prompt_override: Optional[str] = None,
-        prompt_config: Optional[dict[str, str]] = None,
-    ) -> _SlideQcSchema:
-        additional_instructions = self._format_prompt_override(prompt_override)
-        resolved_prompt_config = self._resolve_prompt_config(prompt_config)
-        return self._parse_model_response(
-            input_content=[
-                {
-                    "role": "system",
-                    "content": resolved_prompt_config["general_system_prompt"] + additional_instructions,
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": resolved_prompt_config["general_user_prompt"],
-                        },
-                        *self._prompt_override_content(prompt_override),
-                        {"type": "input_image", "image_url": self._image_to_data_url(candidate_image)},
-                        {"type": "input_image", "image_url": self._image_to_data_url(reference_image)},
-                    ],
-                },
-            ]
-        )
-
-    def _invoke_text_model(
-        self,
-        *,
+        comparison_panel: Image.Image,
         candidate_image: Image.Image,
         reference_image: Image.Image,
         text_context: str,
-        text_discrepancies: list[_TextDiscrepancySupport],
-        reference_fit: _CanvasFit,
         prompt_override: Optional[str] = None,
         prompt_config: Optional[dict[str, str]] = None,
     ) -> _SlideQcSchema:
         additional_instructions = self._format_prompt_override(prompt_override)
         resolved_prompt_config = self._resolve_prompt_config(prompt_config)
-        discrepancy_content = self._build_text_discrepancy_content(
-            candidate_image=candidate_image,
-            reference_image=reference_image,
-            text_discrepancies=text_discrepancies,
-            reference_fit=reference_fit,
-        )
         return self._parse_model_response(
             input_content=[
                 {
                     "role": "system",
-                    "content": resolved_prompt_config["text_system_prompt"] + additional_instructions,
+                    "content": (
+                        resolved_prompt_config["general_system_prompt"]
+                        + "\n\n"
+                        + resolved_prompt_config["text_system_prompt"]
+                        + additional_instructions
+                    ),
                 },
                 {
                     "role": "user",
                     "content": [
                         {
                             "type": "input_text",
-                            "text": resolved_prompt_config["text_user_prompt"],
+                            "text": (
+                                resolved_prompt_config["general_user_prompt"]
+                                + "\n\n"
+                                + resolved_prompt_config["text_user_prompt"]
+                            ),
                         },
                         *self._prompt_override_content(prompt_override),
                         {
                             "type": "input_text",
                             "text": text_context,
                         },
+                        {"type": "input_image", "image_url": self._image_to_data_url(comparison_panel)},
                         {"type": "input_image", "image_url": self._image_to_data_url(candidate_image)},
                         {"type": "input_image", "image_url": self._image_to_data_url(reference_image)},
-                        *discrepancy_content,
                     ],
                 },
             ]
@@ -390,18 +306,92 @@ class OpenAIQCEvaluator:
         *,
         candidate_page: PageImage,
         reference_page: PageImage,
-    ) -> tuple[Image.Image, Image.Image, _CanvasFit]:
+    ) -> tuple[Image.Image, Image.Image]:
         candidate_source = Image.fromarray(candidate_page.image)
         reference_source = Image.fromarray(reference_page.image)
 
         candidate_scaled = self._scale_image(candidate_source)
         reference_scaled = self._scale_image(reference_source)
-        reference_canvas, reference_fit = self._fit_image_to_canvas(reference_scaled, candidate_scaled.size)
-        return (
-            candidate_scaled,
-            reference_canvas,
-            reference_fit,
+        return (candidate_scaled, reference_scaled)
+
+    def _build_side_by_side_comparison(
+        self,
+        *,
+        candidate_image: Image.Image,
+        reference_image: Image.Image,
+    ) -> Image.Image:
+        gutter = max(28, int(round(max(candidate_image.height, reference_image.height) * 0.02)))
+        header_height = max(72, int(round(max(candidate_image.height, reference_image.height) * 0.08)))
+        outer_padding = max(24, gutter)
+        background = (244, 244, 244)
+        pane_background = (255, 255, 255)
+        label_color = (40, 40, 40)
+        border_color = (214, 214, 214)
+        candidate_label = "PPTX CANDIDATE"
+        reference_label = "PDF REFERENCE"
+        target_height = max(candidate_image.height, reference_image.height)
+        candidate_resized = self._contain_with_height(candidate_image, target_height)
+        reference_resized = self._contain_with_height(reference_image, target_height)
+        panel_width = (
+            outer_padding * 2
+            + candidate_resized.width
+            + reference_resized.width
+            + gutter
         )
+        panel_height = outer_padding * 2 + header_height + target_height
+        panel = Image.new("RGB", (panel_width, panel_height), background)
+        draw = ImageDraw.Draw(panel)
+        font = self._label_font(max(18, int(round(header_height * 0.32))))
+
+        candidate_left = outer_padding
+        reference_left = outer_padding + candidate_resized.width + gutter
+        pane_top = outer_padding + header_height
+
+        draw.rectangle(
+            (candidate_left - 1, pane_top - 1, candidate_left + candidate_resized.width, pane_top + target_height),
+            fill=pane_background,
+            outline=border_color,
+            width=1,
+        )
+        draw.rectangle(
+            (reference_left - 1, pane_top - 1, reference_left + reference_resized.width, pane_top + target_height),
+            fill=pane_background,
+            outline=border_color,
+            width=1,
+        )
+        panel.paste(candidate_resized, (candidate_left, pane_top))
+        panel.paste(reference_resized, (reference_left, pane_top))
+
+        candidate_label_bbox = draw.textbbox((0, 0), candidate_label, font=font)
+        reference_label_bbox = draw.textbbox((0, 0), reference_label, font=font)
+        draw.text(
+            (candidate_left, outer_padding + (header_height - (candidate_label_bbox[3] - candidate_label_bbox[1])) / 2),
+            candidate_label,
+            fill=label_color,
+            font=font,
+        )
+        draw.text(
+            (reference_left, outer_padding + (header_height - (reference_label_bbox[3] - reference_label_bbox[1])) / 2),
+            reference_label,
+            fill=label_color,
+            font=font,
+        )
+        return panel
+
+    @staticmethod
+    def _contain_with_height(image: Image.Image, target_height: int) -> Image.Image:
+        if image.height == target_height:
+            return image
+        scale = target_height / float(max(image.height, 1))
+        target_width = max(1, int(round(image.width * scale)))
+        return image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+
+    @staticmethod
+    def _label_font(size: int):
+        try:
+            return ImageFont.truetype("DejaVuSans-Bold.ttf", size=size)
+        except OSError:  # pragma: no cover - environment fallback
+            return ImageFont.load_default()
 
     def _scale_image(self, image: Image.Image) -> Image.Image:
         if self.max_image_dimension <= 0:
@@ -516,7 +506,7 @@ class OpenAIQCEvaluator:
             current_id += 1
         return findings
 
-    def _filter_general_findings(
+    def _filter_visual_findings(
         self,
         findings: list[SlideQcFinding],
         *,
@@ -526,6 +516,11 @@ class OpenAIQCEvaluator:
         for finding in findings:
             if finding.finding_type == QcFindingType.SIZE_POSITION_ISSUE:
                 continue
+            if finding.finding_type == QcFindingType.LINE_BREAK_ISSUE:
+                continue
+            if finding.finding_type in {QcFindingType.MISSING_CONTENT, QcFindingType.EXTRA_CONTENT}:
+                if self._bbox_is_within_edge_band(finding.bbox):
+                    continue
             if finding.finding_type == QcFindingType.WRONG_COLOR:
                 if finding.confidence < 0.9:
                     continue
@@ -535,6 +530,19 @@ class OpenAIQCEvaluator:
                     continue
             kept.append(finding)
         return kept
+
+    @staticmethod
+    def _bbox_is_within_edge_band(
+        bbox: tuple[float, float, float, float],
+        *,
+        edge_band: float = 0.045,
+    ) -> bool:
+        return (
+            bbox[2] <= edge_band
+            or bbox[0] >= 1.0 - edge_band
+            or bbox[3] <= edge_band
+            or bbox[1] >= 1.0 - edge_band
+        )
 
     def _text_color_finding_matches_region(
         self,
@@ -609,17 +617,13 @@ class OpenAIQCEvaluator:
     def _build_text_context(
         self,
         *,
-        reference_layout: Optional[TextLayout],
         candidate_layout: Optional[TextLayout],
-        text_discrepancies: list[_TextDiscrepancySupport],
     ) -> str:
         return (
-            "Structured text extracted from the two sources is provided below. "
-            "Use it as strong evidence for wording, spelling, and number discrepancies while still checking the images. "
-            "Review suspicious text items line by line.\n\n"
-            f"Potential text discrepancies from deterministic diff:\n{self._format_text_discrepancies(text_discrepancies)}\n\n"
-            f"Candidate PowerPoint text:\n{self._format_layout(candidate_layout)}\n\n"
-            f"Reference PDF text:\n{self._format_layout(reference_layout)}"
+            "Supporting candidate-side text extracted from the PPTX file is provided below. "
+            "Use it to verify small or shaky text regions on the PPTX candidate side only. "
+            "Do not assume any PDF text extraction is available.\n\n"
+            f"Candidate PowerPoint text:\n{self._format_layout(candidate_layout)}"
         )
 
     def _format_layout(self, layout: Optional[TextLayout], *, max_items: int = 36) -> str:
@@ -995,17 +999,30 @@ class OpenAIQCEvaluator:
         self,
         *,
         debug_output_dir: Path,
+        comparison_panel: Image.Image,
         candidate_image: Image.Image,
         reference_image: Image.Image,
         prompt_override: Optional[str] = None,
         prompt_config: Optional[dict[str, str]] = None,
     ) -> None:
         debug_output_dir.mkdir(parents=True, exist_ok=True)
+        comparison_panel_png_bytes = OpenAIQCEvaluator._image_to_png_bytes(comparison_panel)
         candidate_png_bytes = OpenAIQCEvaluator._image_to_png_bytes(candidate_image)
         reference_png_bytes = OpenAIQCEvaluator._image_to_png_bytes(reference_image)
-        (debug_output_dir / "01-candidate-slide.png").write_bytes(candidate_png_bytes)
-        (debug_output_dir / "02-reference-page.png").write_bytes(reference_png_bytes)
+        (debug_output_dir / "01-comparison-panel.png").write_bytes(comparison_panel_png_bytes)
+        (debug_output_dir / "02-candidate-slide.png").write_bytes(candidate_png_bytes)
+        (debug_output_dir / "03-reference-page.png").write_bytes(reference_png_bytes)
         metadata = {
+            "comparison_panel": {
+                "width": comparison_panel.width,
+                "height": comparison_panel.height,
+                "png_bytes": len(comparison_panel_png_bytes),
+                "sha256": hashlib.sha256(comparison_panel_png_bytes).hexdigest(),
+                "labels": {
+                    "left": "PPTX candidate",
+                    "right": "PDF reference",
+                },
+            },
             "candidate": {
                 "width": candidate_image.width,
                 "height": candidate_image.height,
@@ -1020,8 +1037,8 @@ class OpenAIQCEvaluator:
             },
             "normalization": {
                 "max_image_dimension": self.max_image_dimension,
-                "candidate_canvas_size": [candidate_image.width, candidate_image.height],
-                "reference_canvas_size": [reference_image.width, reference_image.height],
+                "candidate_image_size": [candidate_image.width, candidate_image.height],
+                "reference_image_size": [reference_image.width, reference_image.height],
                 "note": (
                     "These PNG files are the exact bytes uploaded to OpenAI by this app. "
                     "Any further internal model-side processing is not visible from the client."
@@ -1031,6 +1048,27 @@ class OpenAIQCEvaluator:
             "prompt_config": self._resolve_prompt_config(prompt_config),
         }
         (debug_output_dir / "00-upload-metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    def _comments_for_output(
+        self,
+        result: _SlideQcSchema,
+        findings: list[SlideQcFinding],
+    ) -> tuple[Optional[str], list[str], Optional[str]]:
+        if not findings:
+            return None, [], None
+        active_types = {finding.finding_type for finding in findings}
+        summary = self._summary_for_output(result, has_kept_findings=True) or "AI review findings"
+        bullets = self._deduplicate_bullets(
+            self._filter_general_bullets(
+                self._bullets_for_output(result, has_kept_findings=True),
+                active_general_types=active_types,
+            )
+        )
+        if not bullets:
+            bullets = [finding.message.strip() for finding in findings if finding.message.strip()]
+        note_parts = [summary]
+        note_parts.extend(f"- {bullet}" for bullet in bullets)
+        return summary, bullets, "\n".join(note_parts)
 
     @staticmethod
     def _format_prompt_override(prompt_override: Optional[str]) -> str:
@@ -1131,7 +1169,19 @@ class OpenAIQCEvaluator:
                 continue
             if any(
                 token in lower
-                for token in ("position", "alignment", "aligned", "shifted", "too far", "narrower", "wider", "chart")
+                for token in (
+                    "position",
+                    "alignment",
+                    "aligned",
+                    "shifted",
+                    "too far",
+                    "narrower",
+                    "wider",
+                    "wrap",
+                    "wrapped",
+                    "line break",
+                    "line-break",
+                )
             ):
                 continue
             filtered.append(bullet)

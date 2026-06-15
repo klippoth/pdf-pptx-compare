@@ -33,7 +33,7 @@ def test_rasterizer_uses_poppler_when_available(monkeypatch, tmp_path: Path) -> 
     assert pages[0].image_path.name == "page-1.png"
 
 
-def test_rasterizer_falls_back_to_fitz_when_poppler_is_unavailable(tmp_path: Path) -> None:
+def test_rasterizer_falls_back_to_fitz_when_poppler_is_unavailable(monkeypatch, tmp_path: Path) -> None:
     pdf_path = tmp_path / "sample.pdf"
     document = fitz.open()
     page = document.new_page(width=160, height=90)
@@ -42,6 +42,7 @@ def test_rasterizer_falls_back_to_fitz_when_poppler_is_unavailable(tmp_path: Pat
     document.close()
 
     rasterizer = Rasterizer(dpi=72)
+    monkeypatch.setattr(rasterizer, "_resolve_poppler_binary", lambda name: None)
     pages = rasterizer.render_pdf(pdf_path, tmp_path / "renders", engine="auto")
 
     assert rasterizer.last_used_engine == "fitz"

@@ -19,19 +19,10 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 function Resolve-PythonCommand {
-  $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
-  if ($pyLauncher) {
-    return @{
-      Executable = $pyLauncher.Source
-      CreateVenvArgs = @("-3", "-m", "venv")
-    }
-  }
-
   $python = Get-Command python -ErrorAction SilentlyContinue
   if ($python) {
     return @{
       Executable = $python.Source
-      CreateVenvArgs = @("-m", "venv")
     }
   }
 
@@ -39,7 +30,13 @@ function Resolve-PythonCommand {
   if ($python3) {
     return @{
       Executable = $python3.Source
-      CreateVenvArgs = @("-m", "venv")
+    }
+  }
+
+  $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
+  if ($pyLauncher) {
+    return @{
+      Executable = $pyLauncher.Source
     }
   }
 
@@ -63,7 +60,10 @@ $entryScript = Join-Path $root "launch_app.py"
 $staticSource = Join-Path $root "app\static"
 
 if (-not (Test-Path $pythonExe)) {
-  Invoke-NativeCommand $pythonCommand.Executable @($pythonCommand.CreateVenvArgs + @($venvPath))
+  & $pythonCommand.Executable -m venv $venvPath
+  if ($LASTEXITCODE -ne 0) {
+    throw "Command failed with exit code ${LASTEXITCODE}: $($pythonCommand.Executable) -m venv $venvPath"
+  }
 }
 
 Assert-PathExists $pythonExe "Windows Python is not installed correctly. Install Python 3 for Windows from python.org, reopen PowerShell, and rerun this script."
@@ -81,6 +81,7 @@ Invoke-NativeCommand $pyInstallerExe `
   --noconfirm `
   --clean `
   --onedir `
+  --windowed `
   --distpath $distPath `
   --workpath $workPath `
   --specpath $specPath `
@@ -91,7 +92,17 @@ Invoke-NativeCommand $pyInstallerExe `
 $bundleRoot = Join-Path $distPath "PDFtoPPTXReference"
 $localEnv = Join-Path $root ".env.local"
 $localEnvExample = Join-Path $root ".env.local.example"
-if (Test-Path $localEnv) {
+$includeLocalEnv = $env:PDF_PPTX_BUNDLE_LOCAL_ENV
+$buildNoAi = $env:PDF_PPTX_BUILD_NO_AI
+$shouldBundleLocalEnv = $true
+if ($includeLocalEnv -and ($includeLocalEnv.ToLower() -eq "0" -or $includeLocalEnv.ToLower() -eq "false")) {
+  $shouldBundleLocalEnv = $false
+}
+if ($buildNoAi -and ($buildNoAi.ToLower() -eq "1" -or $buildNoAi.ToLower() -eq "true")) {
+  "PDF_PPTX_ENABLE_AI_QC=false`n" | Set-Content (Join-Path $bundleRoot ".env.local") -Encoding UTF8
+  Write-Host "Bundled no-AI .env.local into the app package."
+}
+elseif ($shouldBundleLocalEnv -and (Test-Path $localEnv)) {
   Copy-Item $localEnv (Join-Path $bundleRoot ".env.local") -Force
   Write-Host "Bundled project-local .env.local into the app package."
 }

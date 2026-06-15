@@ -18,6 +18,18 @@ def test_project_specific_openai_key_overrides_global_openai_key(monkeypatch) ->
         config.get_settings.cache_clear()
 
 
+def test_ai_qc_can_be_disabled_via_env(monkeypatch) -> None:
+    monkeypatch.setenv("PDF_PPTX_ENABLE_AI_QC", "false")
+    config.get_settings.cache_clear()
+
+    try:
+        settings = config.get_settings()
+
+        assert settings.enable_ai_qc is False
+    finally:
+        config.get_settings.cache_clear()
+
+
 def test_apply_env_file_loads_project_local_values(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("PDF_PPTX_OPENAI_API_KEY", raising=False)
     env_file = tmp_path / ".env.local"

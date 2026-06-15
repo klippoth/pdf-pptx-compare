@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import platform
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
@@ -15,6 +15,7 @@ class Settings:
     static_dir: Path
     runs_dir: Path
     platform_name: str
+    downloads_dir: Path = field(default_factory=lambda: Path.home() / "Downloads")
     cleanup_after_hours: int = 24
     render_dpi: int = 240
     enable_powerpoint_fallback: bool = False
@@ -25,6 +26,7 @@ class Settings:
     google_document_ai_location: Optional[str] = None
     google_document_ai_processor_id: Optional[str] = None
     google_document_ai_processor_version: Optional[str] = None
+    enable_ai_qc: bool = True
     openai_api_key: Optional[str] = None
     openai_qc_model: str = "gpt-5.3-chat-latest"
     openai_qc_parallelism: int = 4
@@ -162,6 +164,17 @@ def _default_runtime_root(platform_name: str) -> Path:
     return Path.home() / ".pdf-to-pptx-reference-placement"
 
 
+def _default_downloads_dir(platform_name: str) -> Path:
+    override = os.getenv("PDF_PPTX_DOWNLOADS_DIR", "").strip()
+    if override:
+        return Path(override)
+    if platform_name == "windows":
+        user_profile = os.getenv("USERPROFILE", "").strip()
+        if user_profile:
+            return Path(user_profile) / "Downloads"
+    return Path.home() / "Downloads"
+
+
 def _default_powerpoint_slide_export_staging_dir(platform_name: str) -> Optional[Path]:
     if platform_name == "darwin":
         return (
@@ -209,6 +222,7 @@ def get_settings() -> Settings:
         base_dir=base_dir,
         static_dir=base_dir / "app" / "static" if _is_frozen() else app_dir / "static",
         runs_dir=_runs_dir(platform_name),
+        downloads_dir=_default_downloads_dir(platform_name),
         platform_name=platform_name,
         enable_powerpoint_fallback=_default_enable_powerpoint_fallback(platform_name),
         powerpoint_app_path=_path_from_env(
@@ -224,6 +238,7 @@ def get_settings() -> Settings:
         google_document_ai_location=os.getenv("PDF_PPTX_GOOGLE_DOC_AI_LOCATION", "").strip() or None,
         google_document_ai_processor_id=os.getenv("PDF_PPTX_GOOGLE_DOC_AI_PROCESSOR_ID", "").strip() or None,
         google_document_ai_processor_version=os.getenv("PDF_PPTX_GOOGLE_DOC_AI_PROCESSOR_VERSION", "").strip() or None,
+        enable_ai_qc=_env_flag("PDF_PPTX_ENABLE_AI_QC", True),
         openai_api_key=(
             os.getenv("PDF_PPTX_OPENAI_API_KEY", "").strip()
             or os.getenv("OPENAI_API_KEY", "").strip()

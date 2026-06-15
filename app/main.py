@@ -12,7 +12,6 @@ from app.schemas import (
     CompareResponse,
     HealthResponse,
     JobStatusResponse,
-    PDFFontInfoResponse,
     QcPromptConfigResponse,
     RendererStatusResponse,
 )
@@ -60,11 +59,15 @@ async def health(request: Request) -> HealthResponse:
             slideImageExportMessage=availability.slide_image_export_message,
             message=availability.message,
         ),
+        aiQcSupported=settings.enable_ai_qc,
+        aiQcAvailable=settings.enable_ai_qc and bool(settings.openai_api_key),
     )
 
 
 @app.get("/api/qc-prompts", response_model=QcPromptConfigResponse)
 async def get_qc_prompts() -> QcPromptConfigResponse:
+    if not settings.enable_ai_qc:
+        raise HTTPException(status_code=404, detail="AI QC is disabled in this build.")
     prompts = OpenAIQCEvaluator.get_default_prompt_config()
     return QcPromptConfigResponse(
         generalSystemPrompt=prompts["general_system_prompt"],
@@ -79,7 +82,7 @@ async def compare(
     request: Request,
     pdf: UploadFile = File(...),
     pptx: UploadFile = File(...),
-    enable_ai_qc: bool = Form(True),
+    enable_ai_qc: bool = Form(False),
     qc_prompt_override: str = Form(""),
     qc_general_system_prompt: str = Form(""),
     qc_general_user_prompt: str = Form(""),
@@ -90,6 +93,9 @@ async def compare(
         raise HTTPException(status_code=400, detail="The `pdf` upload must be a .pdf file.")
     if Path(pptx.filename or "").suffix.lower() != ".pptx":
         raise HTTPException(status_code=400, detail="The `pptx` upload must be a .pptx file.")
+
+    if not settings.enable_ai_qc:
+        enable_ai_qc = False
 
     prompt_override = qc_prompt_override.strip()
     if len(prompt_override) > MAX_QC_PROMPT_OVERRIDE_CHARS:
@@ -136,18 +142,6 @@ async def get_job(job_id: str, request: Request) -> JobStatusResponse:
         outputReady=bool(job.output_pptx_path and job.output_pptx_path.exists()),
         aiQcEnabled=job.enable_ai_qc,
         pdfPageCount=job.pdf_page_count,
-        pdfPageCharacterTotals=job.pdf_page_character_totals,
-        pdfFonts=[
-            PDFFontInfoResponse(
-                name=font.name,
-                fontType=font.font_type,
-                embedded=font.embedded,
-                subset=font.subset,
-                pageNumbers=font.page_numbers,
-                pageCharacterCounts=font.page_character_counts,
-            )
-            for font in job.pdf_fonts
-        ],
         qcCountsByType=job.qc_counts_by_type,
         qcManualReviewCount=job.qc_manual_review_count,
         error=job.error,

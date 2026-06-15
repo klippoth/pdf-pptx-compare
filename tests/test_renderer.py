@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
+import zipfile
 
 import pytest
 from pptx import Presentation
@@ -453,6 +455,44 @@ def test_renderer_build_output_with_reference_slides_delegates_to_powerpoint(tmp
     assert output == tmp_path / "output.pptx"
     assert output.exists()
     assert powerpoint.output_build_called is True
+
+
+def test_renderer_normalizes_native_reference_slide_names_in_final_pptx(tmp_path: Path) -> None:
+    presentation = Presentation()
+    while len(presentation.slides) < 2:
+        presentation.slides.add_slide(presentation.slide_layouts[6])
+    output_path = tmp_path / "native-output.pptx"
+    presentation.save(output_path)
+
+    with zipfile.ZipFile(output_path, "r") as source_zip:
+        entries = {item.filename: source_zip.read(item.filename) for item in source_zip.infolist()}
+        infos = {item.filename: item for item in source_zip.infolist()}
+
+    entries["ppt/slides/slide1.xml"] = re.sub(
+        rb'(<(?:[\w]+:)?cSld\b)',
+        rb'\1 name="PDF_ORIGINAL_001"',
+        entries["ppt/slides/slide1.xml"],
+        count=1,
+    )
+    entries["ppt/slides/slide2.xml"] = re.sub(
+        rb'(<(?:[\w]+:)?cSld\b)',
+        rb'\1 name="KeepMe"',
+        entries["ppt/slides/slide2.xml"],
+        count=1,
+    )
+    with zipfile.ZipFile(output_path, "w") as target_zip:
+        for filename, data in entries.items():
+            target_zip.writestr(infos[filename], data)
+
+    Renderer._normalize_reference_slide_names(output_path)
+
+    with zipfile.ZipFile(output_path, "r") as final_zip:
+        slide1 = final_zip.read("ppt/slides/slide1.xml")
+        slide2 = final_zip.read("ppt/slides/slide2.xml")
+
+    assert b'name="PDF_ORIGINAL"' in slide1
+    assert b"PDF_ORIGINAL_001" not in slide1
+    assert b'name="KeepMe"' in slide2
 
 
 def test_powerpoint_renderer_finalizes_macos_slide_exports_into_job_folder(tmp_path: Path) -> None:
